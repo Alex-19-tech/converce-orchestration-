@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.94.0] - 2026-10-15
+
+### Added
+
+- **Per-call instance targeting for embedders.** An embedder that routes one credential to several n8n instances can set the new `InstanceContext.instanceArgument: true`. With it set, every management tool (`n8n_*`) advertises an optional `instance` string argument: the name of the n8n instance that one call should target. The server does not route on it. The embedder reads it from the request and routes the call itself. The server drops the argument before running the tool, so tool handlers never see it. Documentation tools and tools registered through `additionalTools` are unchanged. Unset or `false` leaves every tool schema unchanged. A non-boolean value makes `validateInstanceContext` reject the context. A host that cached the tool list sees the argument only after it fetches the list again.
+
 ## [2.93.0] - 2026-10-14
 
 ### Changed

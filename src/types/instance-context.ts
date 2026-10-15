@@ -44,6 +44,14 @@ export interface InstanceContext {
   uiAppsEnabled?: boolean;
 
   /**
+   * Per-call instance targeting. `true` advertises an optional `instance` argument on
+   * every management tool, for embedders that route one credential to several n8n
+   * instances and read the argument themselves. The server never acts on it and drops
+   * it before dispatch. Unset or `false` leaves the tool schemas unchanged.
+   */
+  instanceArgument?: boolean;
+
+  /**
    * Extensible metadata for future use
    * Allows passing additional configuration without interface changes
    */
@@ -64,6 +72,7 @@ const INSTANCE_CONTEXT_KEYS = [
   'instanceId',
   'sessionId',
   'uiAppsEnabled',
+  'instanceArgument',
   'metadata'
 ] as const satisfies readonly (keyof InstanceContext)[];
 
@@ -193,11 +202,12 @@ export function isInstanceContext(obj: any): obj is InstanceContext {
   const hasValidMetadata = obj.metadata === undefined ||
     (typeof obj.metadata === 'object' && obj.metadata !== null);
   const hasValidUiAppsEnabled = obj.uiAppsEnabled === undefined || typeof obj.uiAppsEnabled === 'boolean';
+  const hasValidInstanceArgument = obj.instanceArgument === undefined || typeof obj.instanceArgument === 'boolean';
 
   return hasValidUrl && hasValidKey && hasValidTimeout && hasValidRetries &&
          hasValidMcpAccessToken &&
          hasValidInstanceId && hasValidSessionId && hasValidMetadata &&
-         hasValidUiAppsEnabled;
+         hasValidUiAppsEnabled && hasValidInstanceArgument;
 }
 
 /**
@@ -283,6 +293,10 @@ export function validateInstanceContext(context: InstanceContext): {
   // reverse) would silently invert the caller's choice.
   if (context.uiAppsEnabled !== undefined && typeof context.uiAppsEnabled !== 'boolean') {
     errors.push(`Invalid uiAppsEnabled: Must be a boolean, got ${typeof context.uiAppsEnabled}`);
+  }
+
+  if (context.instanceArgument !== undefined && typeof context.instanceArgument !== 'boolean') {
+    errors.push(`Invalid instanceArgument: Must be a boolean, got ${typeof context.instanceArgument}`);
   }
 
   return {

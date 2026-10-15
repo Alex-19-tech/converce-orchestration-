@@ -62,6 +62,7 @@ import {
 import { BreakingChangeDetector, VersionUpgradeAnalysis } from '../services/breaking-change-detector';
 import { normalizeNodeVersion } from '../parsers/node-parser';
 import { InstanceContext } from '../types/instance-context';
+import { isInstanceArgumentEnabled, withInstanceArgument, withoutInstanceArgument } from './instance-argument';
 import type { AdditionalTool, AdditionalToolContext } from '../types/additional-tools';
 import { telemetry } from '../telemetry';
 import { EarlyErrorLogger } from '../telemetry/early-error-logger';
@@ -878,6 +879,12 @@ export class N8NDocumentationMCPServer {
       if (isUIAppsEnabled(this.instanceContext)) {
         tools = UIAppRegistry.injectToolMeta(tools);
       }
+
+      // Per-call instance targeting: advertise `instance` on the management tools only.
+      if (isInstanceArgumentEnabled(this.instanceContext)) {
+        const managementToolNames = new Set(n8nManagementTools.map(tool => tool.name));
+        tools = tools.map(tool => managementToolNames.has(tool.name) ? withInstanceArgument(tool) : tool);
+      }
       return { tools };
     });
 
@@ -977,6 +984,11 @@ export class N8NDocumentationMCPServer {
       // Removing them makes Zod treat them as missing (which .optional() allows).
       if (processedArgs) {
         processedArgs = JSON.parse(JSON.stringify(processedArgs));
+      }
+
+      // Per-call instance targeting is routed by the embedder; no handler takes it.
+      if (!isAdditionalTool) {
+        processedArgs = withoutInstanceArgument(processedArgs);
       }
 
       // Check if the requested operation is disabled via DISABLED_TOOL_OPERATIONS.
