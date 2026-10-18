@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.94.1] - 2026-10-18
+
+### Security
+
+- Fix cloud metadata blocking for IPv6 addresses in the URL validator (GHSA-xf82-4743-c4gm). Reported by @Mirr2.
+
 ## [2.94.0] - 2026-10-15
 
 ### Added

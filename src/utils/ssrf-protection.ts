@@ -66,6 +66,11 @@ const CLOUD_METADATA = new Set([
   '100.100.100.200', // Alibaba Cloud metadata
   // Oracle Cloud
   '192.0.0.192',     // Oracle Cloud metadata
+  // SECURITY (GHSA-xf82-4743-c4gm): IPv6 metadata endpoints
+  'fd00:ec2::254',   // AWS IMDS (IPv6)
+  'fd20:ce::254',    // GCP metadata (IPv6)
+  'fe80::a9fe:a9fe', // OpenStack metadata (IPv6)
+  'fd00:a9fe:a9fe::1', // Linode metadata (IPv6)
 ]);
 
 // Localhost patterns
@@ -94,6 +99,26 @@ const PRIVATE_IP_RANGES = [
 ];
 
 export class SSRFProtection {
+  /**
+   * SECURITY (GHSA-xf82-4743-c4gm): canonical WHATWG form of an IPv6
+   * address, or null when it does not parse as a URL host.
+   */
+  private static canonicalIPv6(addr: string): string | null {
+    try {
+      return new URL(`http://[${addr}]/`).hostname.slice(1, -1);
+    } catch {
+      return null;
+    }
+  }
+
+  /** SECURITY (GHSA-xf82-4743-c4gm): cloud metadata check on the canonical form. */
+  private static isCloudMetadata(host: string): boolean {
+    if (CLOUD_METADATA.has(host)) return true;
+    if (!isIPv6(host)) return false;
+    const canonical = SSRFProtection.canonicalIPv6(host);
+    return canonical !== null && CLOUD_METADATA.has(canonical);
+  }
+
   /**
    * Whether a bracket-stripped host names the local machine: a LOCALHOST_PATTERNS entry
    * (these include `0.0.0.0`, the unspecified address rather than a loopback one) or any
@@ -193,12 +218,18 @@ export class SSRFProtection {
   private static tryExtractTunneledIPv4(hostname: string): string | 'non_canonical' | null {
     let parsed: ReturnType<typeof ipaddr.parse>;
     try {
-      parsed = ipaddr.parse(hostname);
+      parsed = ipaddr.parse(SSRFProtection.canonicalIPv6(hostname) ?? hostname);
     } catch {
       return null;
     }
     if (parsed.kind() !== 'ipv6') return null;
     const p = (parsed as ipaddr.IPv6).parts;
+
+    // SECURITY (GHSA-xf82-4743-c4gm): ::/96, ::ffff:0:0/96 and ::ffff:0:0:0/96
+    if (p[0] === 0 && p[1] === 0 && p[2] === 0 && p[3] === 0 &&
+        ((p[4] === 0 && (p[5] === 0 || p[5] === 0xffff)) || (p[4] === 0xffff && p[5] === 0))) {
+      return SSRFProtection.hextetsToIPv4(p[6], p[7]);
+    }
 
     // NAT64 64:ff9b: family — both layouts here put the IPv4 in the last 32
     // bits, so we recognize only the /96 well-known position for each.
@@ -275,6 +306,8 @@ export class SSRFProtection {
    */
   private static tunneledIPv6BlockReason(addr: string): string | null {
     if (!isIPv6(addr)) return null;
+    // SECURITY (GHSA-xf82-4743-c4gm): fail closed
+    if (SSRFProtection.canonicalIPv6(addr) === null) return 'IPv6 private/mapped address not allowed';
     const embedded = SSRFProtection.tryExtractTunneledIPv4(addr);
     if (embedded === 'non_canonical') return 'IPv6 private/mapped address not allowed';
     if (typeof embedded === 'string' && CLOUD_METADATA.has(embedded)) {
@@ -320,7 +353,7 @@ export class SSRFProtection {
       }
 
       // Step 2: ALWAYS block cloud metadata endpoints (all modes)
-      if (CLOUD_METADATA.has(hostname)) {
+      if (SSRFProtection.isCloudMetadata(hostname)) {
         logger.warn('SSRF blocked: Cloud metadata endpoint', { hostname, mode });
         return { valid: false, reason: 'Cloud metadata endpoint blocked' };
       }
@@ -393,7 +426,7 @@ export class SSRFProtection {
     mode: SecurityMode
   ): { valid: boolean; reason?: string } {
     // Step 4: ALWAYS block cloud metadata IPs (all modes)
-    if (CLOUD_METADATA.has(resolvedIP)) {
+    if (SSRFProtection.isCloudMetadata(resolvedIP)) {
       logger.warn('SSRF blocked: Hostname resolves to cloud metadata IP', {
         hostname,
         resolvedIP,
@@ -614,7 +647,7 @@ export class SSRFProtection {
       hostname = hostname.slice(1, -1);
     }
 
-    if (CLOUD_METADATA.has(hostname)) {
+    if (SSRFProtection.isCloudMetadata(hostname)) {
       return { valid: false, reason: 'Cloud metadata endpoint blocked' };
     }
 

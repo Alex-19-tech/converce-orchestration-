@@ -277,6 +277,66 @@ describe('SSRFProtection', () => {
       expect(result.reason).toBe('IPv6 private/mapped address not allowed');
     });
 
+    const ipv6MetadataLiterals = [
+      'http://[fd00:ec2::254]/latest/meta-data/',
+      'http://[fd00:0ec2:0:0:0:0:0:0254]/',
+      'http://[fd20:ce::254]/computeMetadata/v1/',
+      'http://[fe80::a9fe:a9fe]/',
+      'http://[::ffff:169.254.169.254]/',
+      'http://[0:0:0:0:0:ffff:a9fe:a9fe]/',
+      'http://[::169.254.169.254]/',
+      'http://[::ffff:169.254.170.2]/',
+      'http://[::ffff:100.100.100.200]/',
+      'http://[::ffff:0:a9fe:a9fe]/',
+      'http://[fd00:a9fe:a9fe::1]/',
+    ];
+
+    it.each(ipv6MetadataLiterals)('blocks IPv6 metadata literal in permissive sync mode: %s', (url) => {
+      const result = SSRFProtection.validateUrlSync(url);
+      expect(result.valid).toBe(false);
+      expect(result.reason).toBe('Cloud metadata endpoint blocked');
+    });
+
+    it.each(ipv6MetadataLiterals)('blocks IPv6 metadata literal in permissive async mode: %s', async (url) => {
+      const result = await SSRFProtection.validateWebhookUrl(url);
+      expect(result.valid).toBe(false);
+      expect(result.reason).toContain('metadata');
+    });
+
+    it.each([
+      'fd00:ec2::254',
+      'fd20:ce::254',
+      'fe80::a9fe:a9fe',
+      '::ffff:a9fe:a9fe',
+      '::a9fe:a9fe',
+      'FD00:EC2::254',
+      'fd00:0ec2:0:0:0:0:0:0254',
+      '::169.254.169.254',
+      '::ffff:169.254.169.254',
+      '::ffff:0:a9fe:a9fe',
+      'fd00:a9fe:a9fe::1',
+    ])('blocks IPv6 metadata address via DNS in permissive async mode: %s', async (address) => {
+      vi.mocked(dns.lookup).mockResolvedValue({ address, family: 6 } as any);
+      const result = await SSRFProtection.validateWebhookUrl('http://evil-domain.com/webhook');
+      expect(result.valid).toBe(false);
+      expect(result.reason).toContain('metadata');
+    });
+
+    it('blocks an IPv6 DNS answer with a zone ID in permissive async mode', async () => {
+      vi.mocked(dns.lookup).mockResolvedValue({ address: 'fe80::a9fe:a9fe%eth0', family: 6 } as any);
+      const result = await SSRFProtection.validateWebhookUrl('http://evil-domain.com/webhook');
+      expect(result.valid).toBe(false);
+    });
+
+    it.each([
+      'http://[::ffff:10.0.0.1]/',
+      'http://[fd00:ec2::1]/',
+      'http://[fd20:ce::1]/',
+    ])('still allows non-metadata private IPv6 in permissive mode: %s', async (url) => {
+      expect(SSRFProtection.validateUrlSync(url).valid).toBe(true);
+      expect((await SSRFProtection.validateWebhookUrl(url)).valid).toBe(true);
+    });
+
     it('should allow public URLs', async () => {
       const result = await SSRFProtection.validateWebhookUrl('https://api.example.com/webhook');
       expect(result.valid).toBe(true);
@@ -791,7 +851,9 @@ describe('SSRFProtection', () => {
           for (const url of payloads) {
             const result = SSRFProtection.validateUrlSync(url);
             expect(result.valid, `url=${url} mode=${mode}`).toBe(false);
-            expect(result.reason).toBe('IPv6 private/mapped address not allowed');
+            expect(result.reason).toBe(url.includes('169.254.169.254')
+              ? 'Cloud metadata endpoint blocked'
+              : 'IPv6 private/mapped address not allowed');
           }
         }
       });
@@ -837,7 +899,9 @@ describe('SSRFProtection', () => {
         for (const url of payloads) {
           const result = SSRFProtection.validateUrlSync(url);
           expect(result.valid, `url=${url}`).toBe(false);
-          expect(result.reason).toBe('IPv6 private/mapped address not allowed');
+          expect(result.reason).toBe(url.includes('169.254.169.254')
+            ? 'Cloud metadata endpoint blocked'
+            : 'IPv6 private/mapped address not allowed');
         }
       });
 
