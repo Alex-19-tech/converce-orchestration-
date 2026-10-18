@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.94.2] - 2026-10-18
+
+### Security
+
+- Fix sensitive data in workflow telemetry (GHSA-gg57-wj7g-vfrv). Reported by @avrlab233. Node notes and workflow descriptions are no longer included in telemetry.
+
 ## [2.94.1] - 2026-10-18
 
 ### Security

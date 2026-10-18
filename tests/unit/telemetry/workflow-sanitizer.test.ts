@@ -1037,6 +1037,188 @@ describe('WorkflowSanitizer', () => {
     });
   });
 
+  describe('node and workflow free-text fields', () => {
+    const KEY_A = 'sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD';
+    const KEY_B = 'sk-proj-zyxwvutsrqponmlkjihgfedcba9876543210WXYZ';
+    const node = (name: string, extra: Record<string, unknown> = {}) => ({
+      id: `id-${name.length}-${name.slice(-4)}`,
+      name,
+      type: 'n8n-nodes-base.set',
+      typeVersion: 3,
+      position: [0, 0] as [number, number],
+      parameters: {},
+      ...extra,
+    });
+    const graph = () => ({
+      nodes: [
+        node('Start'),
+        node(`Call ${KEY_A}`, { notes: 'Bearer note-secret-value', notesInFlow: true }),
+        node(`Call ${KEY_B}`),
+        node('Code1'),
+      ],
+      connections: {
+        Start: { main: [[
+          { node: `Call ${KEY_A}`, type: 'main', index: 0 },
+          { node: `Call ${KEY_B}`, type: 'main', index: 0 },
+        ]] },
+        [`Call ${KEY_A}`]: { main: [[{ node: 'Code1', type: 'main', index: 0 }]] },
+      },
+    });
+
+    it.each([
+      ['sanitizeWorkflow', (wf: any) => WorkflowSanitizer.sanitizeWorkflow(wf)],
+      ['sanitizeWorkflowRaw', (wf: any) => WorkflowSanitizer.sanitizeWorkflowRaw(wf)],
+    ])('%s removes node notes and keeps notesInFlow', (_label, sanitize) => {
+      const out = sanitize(graph());
+      const json = JSON.stringify(out);
+      expect(json).not.toContain('note-secret-value');
+      expect(out.nodes.every((n: any) => !('notes' in n))).toBe(true);
+      expect(out.nodes[1].notesInFlow).toBe(true);
+    });
+
+    it.each([
+      ['sanitizeWorkflow', (wf: any) => WorkflowSanitizer.sanitizeWorkflow(wf)],
+      ['sanitizeWorkflowRaw', (wf: any) => WorkflowSanitizer.sanitizeWorkflowRaw(wf)],
+    ])('%s sanitizes node names and keeps connections consistent', (_label, sanitize) => {
+      const out = sanitize(graph());
+      const json = JSON.stringify(out);
+      expect(json).not.toContain(KEY_A);
+      expect(json).not.toContain(KEY_B);
+
+      const names = out.nodes.map((n: any) => n.name);
+      expect(new Set(names).size).toBe(names.length);
+      expect(names).toContain('Start');
+      expect(names).toContain('Code1');
+
+      const nameSet = new Set(names);
+      for (const [source, byType] of Object.entries<any>(out.connections)) {
+        expect(nameSet.has(source)).toBe(true);
+        for (const outputs of Object.values<any>(byType)) {
+          for (const conns of outputs) {
+            for (const conn of conns) expect(nameSet.has(conn.node)).toBe(true);
+          }
+        }
+      }
+      expect(out.connections.Start.main[0]).toHaveLength(2);
+      expect(out.connections.Start.main[0][0].node).not.toBe(out.connections.Start.main[0][1].node);
+    });
+
+    it('leaves ordinary node names and connections unchanged', () => {
+      const wf = {
+        nodes: [node('Webhook'), node('HTTP Request1')],
+        connections: { Webhook: { main: [[{ node: 'HTTP Request1', type: 'main', index: 0 }]] } },
+      };
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw(wf);
+      expect(out.nodes.map((n: any) => n.name)).toEqual(['Webhook', 'HTTP Request1']);
+      expect(out.connections).toEqual(wf.connections);
+    });
+
+    it('sanitizeWorkflowRaw sanitizes workflow-level fields and drops sharing and description', () => {
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw({
+        ...graph(),
+        name: 'Sync for jane.doe@example.com',
+        description: 'internal runbook text',
+        meta: { comment: 'Bearer meta-secret-value-123' },
+        tags: [{ id: 't1', name: 'owner jane.doe@example.com' }],
+        shared: [{ project: { name: 'Jane Doe <jane.doe@example.com>' } }],
+        homeProject: { name: 'Jane Doe <jane.doe@example.com>' },
+      });
+      const json = JSON.stringify(out);
+      expect(json).not.toContain('jane.doe@example.com');
+      expect(json).not.toContain('meta-secret-value-123');
+      expect(json).not.toContain('internal runbook text');
+      expect(out).not.toHaveProperty('shared');
+      expect(out).not.toHaveProperty('homeProject');
+      expect(out).not.toHaveProperty('description');
+      expect(out.name).toBe('Sync for [REDACTED_EMAIL]');
+    });
+
+    it('gives a redacted node the same name in the before and after snapshots', () => {
+      const before = WorkflowSanitizer.sanitizeWorkflowRaw(graph());
+      const after = WorkflowSanitizer.sanitizeWorkflowRaw({
+        nodes: [node('Start'), node(`Call ${KEY_B}`)],
+        connections: { Start: { main: [[{ node: `Call ${KEY_B}`, type: 'main', index: 0 }]] } },
+      });
+      expect(after.nodes[1].name).toBe(before.nodes[2].name);
+      expect(after.nodes[1].name).not.toBe(before.nodes[1].name);
+    });
+
+    it('sanitizes node fields other than the structural ones', () => {
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw({
+        nodes: [node('Webhook', { extra: { memo: 'Bearer extra-secret-value-123' }, disabled: true, onError: 'continueRegularOutput' })],
+        connections: {},
+      });
+      const json = JSON.stringify(out);
+      expect(json).not.toContain('extra-secret-value-123');
+      expect(out.nodes[0].disabled).toBe(true);
+      expect(out.nodes[0].onError).toBe('continueRegularOutput');
+    });
+
+    it('sanitizes nodes and connections that are not in the expected shape', () => {
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw({
+        nodes: { a: { parameters: { apiKey: 'nodes-object-secret-123' }, notes: 'Bearer nodes-object-note-123' } },
+        connections: {
+          A: 'Bearer conn-string-secret-123',
+          B: { main: 'Bearer conn-type-secret-123' },
+          C: { main: ['Bearer conn-entry-secret-123', [null, 'Bearer conn-item-secret-123']] },
+        },
+      });
+      const json = JSON.stringify(out);
+      for (const marker of ['nodes-object-secret-123', 'nodes-object-note-123', 'conn-string-secret-123', 'conn-type-secret-123', 'conn-entry-secret-123', 'conn-item-secret-123']) {
+        expect(json).not.toContain(marker);
+      }
+    });
+
+    it('sanitizeWorkflowRaw applies the full workflow pass to arrays of workflow versions', () => {
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw({
+        ...graph(),
+        versions: [{ versionId: 'v1', ...graph() }],
+      });
+      const json = JSON.stringify(out.versions);
+      expect(json).not.toContain(KEY_A);
+      expect(json).not.toContain('note-secret-value');
+    });
+
+    it('sanitizeWorkflowRaw keeps workflow metadata the backend reads', () => {
+      const wf = {
+        ...graph(),
+        id: 'Ab3dE5gH7jK9mN1p',
+        versionId: '7d0a6f3c-1b2e-4c5d-8e9f-0a1b2c3d4e5f',
+        active: true,
+        createdAt: '2026-10-01T10:00:00.000Z',
+        updatedAt: '2026-10-18T10:00:00.000Z',
+        settings: { executionOrder: 'v1', timezone: 'Europe/Warsaw', saveManualExecutions: true },
+      };
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw(wf);
+      expect(out.id).toBe(wf.id);
+      expect(out.versionId).toBe(wf.versionId);
+      expect(out.active).toBe(true);
+      expect(out.createdAt).toBe(wf.createdAt);
+      expect(out.updatedAt).toBe(wf.updatedAt);
+      expect(out.settings).toEqual(wf.settings);
+    });
+
+    it('sanitizeWorkflowRaw applies the full workflow pass to a nested active version', () => {
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw({
+        ...graph(),
+        activeVersion: {
+          versionId: '7d0a6f3c-1b2e-4c5d-8e9f-0a1b2c3d4e5f',
+          nodes: [node('HTTP', {
+            parameters: { headerParameters: { parameters: [{ name: 'Authorization', value: 'Bearer active-secret-123456' }] } },
+            credentials: { httpHeaderAuth: { id: '1', name: 'Prod key' } },
+            notes: 'active note text',
+          })],
+          connections: {},
+        },
+      });
+      const json = JSON.stringify(out.activeVersion);
+      expect(json).not.toContain('active-secret-123456');
+      expect(json).not.toContain('active note text');
+      expect(out.activeVersion.nodes[0]).not.toHaveProperty('credentials');
+      expect(out.activeVersion.versionId).toBe('7d0a6f3c-1b2e-4c5d-8e9f-0a1b2c3d4e5f');
+    });
+  });
+
   describe('non-secret workflow structure survives (n8n-mcp-backend#151)', () => {
     const NODE_ID = '6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b';
 

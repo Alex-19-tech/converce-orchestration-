@@ -14,6 +14,7 @@ interface WorkflowNode {
   credentials?: any;
   disabled?: boolean;
   typeVersion?: number;
+  notes?: string;
 }
 
 interface SanitizedWorkflow {
@@ -240,17 +241,7 @@ export class WorkflowSanitizer {
     // Create a deep copy to avoid modifying original
     const sanitized = JSON.parse(JSON.stringify(workflow));
 
-    // Sanitize nodes
-    if (sanitized.nodes && Array.isArray(sanitized.nodes)) {
-      sanitized.nodes = sanitized.nodes.map((node: WorkflowNode) =>
-        this.sanitizeNode(node)
-      );
-    }
-
-    // Sanitize connections (keep structure only)
-    if (sanitized.connections) {
-      sanitized.connections = this.sanitizeConnections(sanitized.connections);
-    }
+    this.sanitizeGraph(sanitized);
 
     // Remove other potentially sensitive data
     delete sanitized.settings?.errorWorkflow;
@@ -324,17 +315,60 @@ export class WorkflowSanitizer {
    * Sanitize a single node
    */
   private static sanitizeNode(node: WorkflowNode): WorkflowNode {
-    const sanitized = { ...node };
+    if (!node || typeof node !== 'object') {
+      return node;
+    }
 
-    // Remove credentials entirely
-    delete sanitized.credentials;
+    // SECURITY (GHSA-gg57-wj7g-vfrv): notes are free text, removed entirely;
+    // fields other than the structural ones are sanitized.
+    const { id, name, type, typeVersion, position, parameters, credentials, notes, ...rest } = node;
+    const sanitized: WorkflowNode = { ...this.sanitizeObject(rest), id, name, type, position } as WorkflowNode;
+    if (typeVersion !== undefined) sanitized.typeVersion = typeVersion;
 
     // Sanitize parameters
-    if (sanitized.parameters) {
-      sanitized.parameters = this.sanitizeObject(sanitized.parameters);
+    if (parameters) {
+      sanitized.parameters = this.sanitizeObject(parameters);
+    } else if (parameters !== undefined) {
+      sanitized.parameters = parameters;
     }
 
     return sanitized;
+  }
+
+  /**
+   * SECURITY (GHSA-gg57-wj7g-vfrv): sanitize nodes and connections in place.
+   * Node names are sanitized through one map so connection keys and targets
+   * keep pointing at the same nodes.
+   */
+  private static sanitizeGraph(workflow: any): void {
+    if (Array.isArray(workflow.nodes)) {
+      workflow.nodes = workflow.nodes.map((node: WorkflowNode) => {
+        const sanitized = this.sanitizeNode(node);
+        if (sanitized && typeof sanitized.name === 'string') {
+          sanitized.name = this.sanitizeNodeName(sanitized.name);
+        }
+        return sanitized;
+      });
+    } else if (workflow.nodes !== undefined) {
+      workflow.nodes = this.sanitizeTelemetryObject(workflow.nodes);
+    }
+
+    if (workflow.connections !== undefined) {
+      workflow.connections = this.sanitizeConnections(workflow.connections);
+    }
+  }
+
+  /**
+   * SECURITY (GHSA-gg57-wj7g-vfrv): a name that needed redaction gets a short
+   * suffix derived from the original, so distinct nodes stay distinct and the
+   * same node gets the same name in every snapshot.
+   */
+  private static sanitizeNodeName(name: string): string {
+    const sanitized = this.sanitizeString(name);
+    if (sanitized === name) {
+      return name;
+    }
+    return `${sanitized} #${createHash('sha256').update(name).digest('hex').substring(0, 8)}`;
   }
 
   /**
@@ -504,34 +538,41 @@ export class WorkflowSanitizer {
    * Sanitize connections (keep structure only)
    */
   private static sanitizeConnections(connections: any): any {
-    if (!connections || typeof connections !== 'object') {
-      return connections;
+    if (!connections || typeof connections !== 'object' || Array.isArray(connections)) {
+      return this.sanitizeTelemetryObject(connections);
     }
 
+    // SECURITY (GHSA-gg57-wj7g-vfrv): node names are renamed with the same
+    // function as the nodes; unexpected shapes are sanitized as data.
     const sanitized: any = {};
 
-    for (const [nodeId, nodeConnections] of Object.entries(connections)) {
-      if (typeof nodeConnections === 'object' && nodeConnections !== null) {
+    for (const [sourceName, nodeConnections] of Object.entries(connections)) {
+      const nodeId = this.sanitizeNodeName(sourceName);
+      if (typeof nodeConnections === 'object' && nodeConnections !== null && !Array.isArray(nodeConnections)) {
         sanitized[nodeId] = {};
 
         for (const [connType, connArray] of Object.entries(nodeConnections as any)) {
           if (Array.isArray(connArray)) {
             sanitized[nodeId][connType] = connArray.map((conns: any) => {
               if (Array.isArray(conns)) {
-                return conns.map((conn: any) => ({
-                  node: conn.node,
-                  type: conn.type,
-                  index: conn.index
-                }));
+                return conns.map((conn: any) =>
+                  conn && typeof conn === 'object'
+                    ? {
+                        node: typeof conn.node === 'string' ? this.sanitizeNodeName(conn.node) : conn.node,
+                        type: conn.type,
+                        index: conn.index
+                      }
+                    : this.sanitizeTelemetryObject(conn)
+                );
               }
-              return conns;
+              return this.sanitizeTelemetryObject(conns);
             });
           } else {
-            sanitized[nodeId][connType] = connArray;
+            sanitized[nodeId][connType] = this.sanitizeTelemetryObject(connArray);
           }
         }
       } else {
-        sanitized[nodeId] = nodeConnections;
+        sanitized[nodeId] = this.sanitizeTelemetryObject(nodeConnections);
       }
     }
 
@@ -554,17 +595,7 @@ export class WorkflowSanitizer {
     // Create a deep copy to avoid modifying original
     const sanitized = JSON.parse(JSON.stringify(workflow));
 
-    // Sanitize nodes
-    if (sanitized.nodes && Array.isArray(sanitized.nodes)) {
-      sanitized.nodes = sanitized.nodes.map((node: WorkflowNode) =>
-        this.sanitizeNode(node)
-      );
-    }
-
-    // Sanitize connections (keep structure only)
-    if (sanitized.connections) {
-      sanitized.connections = this.sanitizeConnections(sanitized.connections);
-    }
+    this.sanitizeGraph(sanitized);
 
     // Remove other potentially sensitive data
     delete sanitized.settings?.errorWorkflow;
@@ -575,6 +606,29 @@ export class WorkflowSanitizer {
     delete sanitized.ownedBy;
     delete sanitized.createdBy;
     delete sanitized.updatedBy;
+    // SECURITY (GHSA-gg57-wj7g-vfrv)
+    delete sanitized.description;
+    delete sanitized.shared;
+    delete sanitized.homeProject;
+
+    // SECURITY (GHSA-gg57-wj7g-vfrv): sanitize every other field; nested
+    // workflow versions get the full workflow pass.
+    const isWorkflowLike = (value: unknown) =>
+      !!value && typeof value === 'object' && Array.isArray((value as any).nodes);
+    const { nodes, connections, ...rest } = sanitized;
+    const others: any = {};
+    for (const [key, value] of Object.entries(rest)) {
+      if (isWorkflowLike(value)) {
+        sanitized[key] = this.sanitizeWorkflowRaw(value);
+      } else if (Array.isArray(value) && value.some(isWorkflowLike)) {
+        sanitized[key] = value.map((item) =>
+          isWorkflowLike(item) ? this.sanitizeWorkflowRaw(item) : this.sanitizeTelemetryObject(item)
+        );
+      } else {
+        others[key] = value;
+      }
+    }
+    Object.assign(sanitized, this.sanitizeObject(others));
 
     return sanitized;
   }
