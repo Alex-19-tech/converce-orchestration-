@@ -20,6 +20,7 @@ import { isNonExecutableNode } from '../utils/node-classification';
 import { validateConditionNodeStructure } from './n8n-validation';
 import { checkNodeGroups } from './node-groups';
 import { ToolVariantGenerator } from './tool-variant-generator';
+import { isDeprecatedNodeVersion, deprecatedNodeMessage, deprecatedNodeReplacementHint } from './deprecated-nodes';
 const logger = new Logger({ prefix: '[WorkflowValidator]' });
 
 /**
@@ -619,6 +620,23 @@ export class WorkflowValidator {
   }
 
   /**
+   * Warn about a node on a deprecated typeVersion. A warning, not an error: the validator
+   * cannot tell a node the caller is adding or editing (which n8n rejects) from an untouched
+   * one in a saved workflow (which n8n accepts).
+   */
+  private checkDeprecatedNode(node: WorkflowNode, nodeInfo: any, result: WorkflowValidationResult): void {
+    if (!nodeInfo || !isDeprecatedNodeVersion(nodeInfo, node.typeVersion)) return;
+
+    result.warnings.push({
+      type: 'warning',
+      nodeId: node.id,
+      nodeName: node.name,
+      code: 'DEPRECATED_NODE',
+      message: `${deprecatedNodeMessage(node.type)} ${deprecatedNodeReplacementHint(nodeInfo.toolVariantOf ?? nodeInfo.nodeType)}`
+    });
+  }
+
+  /**
    * Validate all nodes in the workflow
    */
   private async validateAllNodes(
@@ -627,6 +645,11 @@ export class WorkflowValidator {
     profile: string
   ): Promise<void> {
     for (const node of workflow.nodes) {
+      // Looked up once per node and reused below. The deprecation check runs before the
+      // disabled skip: n8n checks disabled nodes too, and toggling one is an edit.
+      const storedNodeInfo = this.nodeRepository.getNode(NodeTypeNormalizer.normalizeToFullForm(node.type));
+      this.checkDeprecatedNode(node, storedNodeInfo, result);
+
       if (node.disabled || isNonExecutableNode(node.type)) continue;
 
       try {
@@ -665,8 +688,8 @@ export class WorkflowValidator {
         // but n8n API requires full form (n8n-nodes-base.*). Never modify the input workflow.
         const normalizedType = NodeTypeNormalizer.normalizeToFullForm(node.type);
 
-        // Get node definition using normalized type (needed for typeVersion validation)
-        let nodeInfo = this.nodeRepository.getNode(normalizedType);
+        // Node definition using the normalized type (needed for typeVersion validation)
+        let nodeInfo = storedNodeInfo;
 
         // Check if this is a dynamic Tool variant (e.g., googleDriveTool, googleSheetsTool)
         // n8n creates these at runtime when ANY node is used in an AI Agent's tool slot,
