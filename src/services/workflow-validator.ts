@@ -279,8 +279,15 @@ function collectMalformedConnectionErrors(connections: Record<string, unknown>):
   return errors;
 }
 
+// Total connection steps the SplitInBatches loop-back checks may walk in one validation
+const MAX_LOOP_BACK_STEPS = 200_000;
+
 export class WorkflowValidator {
   private currentWorkflow: WorkflowJson | null = null;
+  private loopBackReach = new Map<string, Set<string>>();
+  private loopBackSteps = 0;
+  private lowerCaseNames = new Map<WorkflowNode, { type: string; name: string }>();
+  private mainInputTargets: { workflow: WorkflowJson; targets: Set<string> } | null = null;
   private similarityService: NodeSimilarityService;
 
   constructor(
@@ -307,6 +314,10 @@ export class WorkflowValidator {
   ): Promise<WorkflowValidationResult> {
     // Store current workflow for access in helper methods
     this.currentWorkflow = workflow;
+    this.loopBackReach = new Map();
+    this.loopBackSteps = MAX_LOOP_BACK_STEPS;
+    this.lowerCaseNames = new Map();
+    this.mainInputTargets = null;
 
     const {
       validateNodes = true,
@@ -2058,7 +2069,8 @@ export class WorkflowValidator {
     result: WorkflowValidationResult,
     profile: string = 'runtime'
   ): void {
-    const nodeNames = workflow.nodes.map(n => n.name);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): one name set shared by every node's expression context
+    const nodeNameSet = new Set(workflow.nodes.map(n => n.name));
 
     for (const node of workflow.nodes) {
       if (node.disabled || isNonExecutableNode(node.type)) continue;
@@ -2072,7 +2084,7 @@ export class WorkflowValidator {
 
       // Create expression context
       const context = {
-        availableNodes: nodeNames.filter(n => n !== node.name),
+        availableNodes: { has: (name: string) => name !== node.name && nodeNameSet.has(name) },
         currentNodeName: node.name,
         hasInputData: this.nodeHasInput(node.name, workflow),
         isInLoop: false // Could be enhanced to detect loop nodes
@@ -2175,16 +2187,19 @@ export class WorkflowValidator {
    * Check if a node has input connections
    */
   private nodeHasInput(nodeName: string, workflow: WorkflowJson): boolean {
-    for (const [sourceName, outputs] of Object.entries(workflow.connections)) {
-      if (outputs.main) {
-        for (const outputConnections of outputs.main) {
-          if (outputConnections?.some(conn => conn.node === nodeName)) {
-            return true;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): collect main-input targets once per workflow
+    if (this.mainInputTargets?.workflow !== workflow) {
+      const targets = new Set<string>();
+      for (const outputs of Object.values(workflow.connections)) {
+        if (outputs.main) {
+          for (const outputConnections of outputs.main) {
+            outputConnections?.forEach(conn => targets.add(conn.node));
           }
         }
       }
+      this.mainInputTargets = { workflow, targets };
     }
-    return false;
+    return this.mainInputTargets.targets.has(nodeName);
   }
 
   /**
@@ -2793,6 +2808,18 @@ export class WorkflowValidator {
   }
 
   /**
+   * Lower-cased node type and name, computed once per node per validation
+   */
+  private lowerCaseNodeNames(node: WorkflowNode): { type: string; name: string } {
+    let names = this.lowerCaseNames.get(node);
+    if (!names) {
+      names = { type: node.type.toLowerCase(), name: node.name.toLowerCase() };
+      this.lowerCaseNames.set(node, names);
+    }
+    return names;
+  }
+
+  /**
    * Validate SplitInBatches node connections for common mistakes
    */
   private validateSplitInBatchesConnection(
@@ -2811,8 +2838,7 @@ export class WorkflowValidator {
     if (outputIndex === 0) {
       // This is the "done" output (index 0)
       // Check if target looks like it should be in the loop
-      const targetType = targetNode.type.toLowerCase();
-      const targetName = targetNode.name.toLowerCase();
+      const { type: targetType, name: targetName } = this.lowerCaseNodeNames(targetNode);
       
       // Common patterns that suggest this node should be inside the loop
       if (targetType.includes('function') || 
@@ -2844,8 +2870,7 @@ export class WorkflowValidator {
     } else if (outputIndex === 1) {
       // This is the "loop" output (index 1)
       // Check if target looks like it should be after the loop
-      const targetType = targetNode.type.toLowerCase();
-      const targetName = targetNode.name.toLowerCase();
+      const { type: targetType, name: targetName } = this.lowerCaseNodeNames(targetNode);
       
       // Common patterns that suggest this node should be after the loop
       if (targetType.includes('aggregate') ||
@@ -2884,42 +2909,53 @@ export class WorkflowValidator {
   private checkForLoopBack(
     startNode: string,
     targetNode: string,
-    nodeMap: Map<string, WorkflowNode>,
-    visited: Set<string> = new Set(),
-    maxDepth: number = 50
+    nodeMap: Map<string, WorkflowNode>
   ): boolean {
-    if (maxDepth <= 0) return false; // Prevent stack overflow
-    if (visited.has(startNode)) return false;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): reuse reachability per start node, with a step budget
+    let reached = this.loopBackReach.get(startNode);
+    if (!reached) {
+      reached = new Set<string>();
+      this.collectLoopBackReach(startNode, nodeMap, new Set(), 50, reached);
+      this.loopBackReach.set(startNode, reached);
+    }
+    return reached.has(targetNode);
+  }
+
+  /**
+   * Collect every node name a depth-first walk from startNode reaches through
+   * connections, up to maxDepth levels.
+   */
+  private collectLoopBackReach(
+    startNode: string,
+    nodeMap: Map<string, WorkflowNode>,
+    visited: Set<string>,
+    maxDepth: number,
+    reached: Set<string>
+  ): void {
+    if (maxDepth <= 0) return; // Prevent stack overflow
+    if (visited.has(startNode)) return;
     visited.add(startNode);
 
     const node = nodeMap.get(startNode);
-    if (!node) return false;
+    if (!node) return;
 
-    // Access connections from the workflow structure, not the node
-    // We need to access this.currentWorkflow.connections[startNode]
     const connections = this.currentWorkflow?.connections[startNode];
-    if (!connections) return false;
+    if (!connections) return;
 
-    for (const [outputType, outputs] of Object.entries(connections)) {
+    for (const outputs of Object.values(connections)) {
       if (!Array.isArray(outputs)) continue;
-      
+
       for (const outputConnections of outputs) {
         if (!Array.isArray(outputConnections)) continue;
-        
+
         for (const conn of outputConnections) {
-          if (conn.node === targetNode) {
-            return true;
-          }
-          
-          // Recursively check connected nodes
-          if (this.checkForLoopBack(conn.node, targetNode, nodeMap, visited, maxDepth - 1)) {
-            return true;
-          }
+          if (this.loopBackSteps <= 0) return;
+          this.loopBackSteps--;
+          reached.add(conn.node);
+          this.collectLoopBackReach(conn.node, nodeMap, visited, maxDepth - 1, reached);
         }
       }
     }
-
-    return false;
   }
 
   /**

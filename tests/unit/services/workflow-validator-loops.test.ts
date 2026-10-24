@@ -1068,4 +1068,41 @@ describe('WorkflowValidator - Loop Node Validation', () => {
       expect(cycleWarnings).toHaveLength(1);
     });
   });
+  describe('large workflows', () => {
+    const buildLoopWorkflow = (loops: number, downstream: number, withExpressions: boolean) => {
+      const nodes: any[] = Array.from({ length: loops }, (_, i) => ({
+        id: `s${i}`, name: `Loop ${i}`, type: 'n8n-nodes-base.splitInBatches', position: [0, 0], parameters: {}
+      }));
+      nodes.push({ id: 'p', name: 'Process Item', type: 'n8n-nodes-base.code', position: [0, 0], parameters: {} });
+      for (let k = 0; k < downstream; k++) {
+        nodes.push({
+          id: `k${k}`, name: `Step ${k}`, type: 'n8n-nodes-base.noOp', position: [0, 0],
+          parameters: withExpressions ? { value: `={{ $('Loop ${k}').item.json.x }}` } : {}
+        });
+      }
+      const connections: any = {
+        'Process Item': { main: [Array.from({ length: downstream }, (_, k) => ({ node: `Step ${k}`, type: 'main', index: 0 }))] }
+      };
+      for (let i = 0; i < loops; i++) {
+        connections[`Loop ${i}`] = { main: [[{ node: 'Process Item', type: 'main', index: 0 }], [{ node: 'Process Item', type: 'main', index: 0 }]] };
+      }
+      return { name: 'Large', nodes, connections };
+    };
+
+    it('handles many loop nodes feeding one node with many downstream nodes', async () => {
+      mockNodeRepository.getNode.mockReturnValue(null);
+      const start = performance.now();
+      const result = await validator.validateWorkflow(buildLoopWorkflow(4000, 4000, false) as any, { validateNodes: false });
+      expect(performance.now() - start).toBeLessThan(2_000);
+      expect(result.warnings.some(w => w.message?.includes("doesn't connect back"))).toBe(true);
+    });
+
+    it('handles many nodes with expressions that reference other nodes', async () => {
+      mockNodeRepository.getNode.mockReturnValue(null);
+      const start = performance.now();
+      const result = await validator.validateWorkflow(buildLoopWorkflow(8000, 8000, true) as any, { validateNodes: false, validateConnections: false });
+      expect(performance.now() - start).toBeLessThan(2_000);
+      expect(result.errors.some(e => e.message?.includes('not found in workflow'))).toBe(false);
+    });
+  });
 });
