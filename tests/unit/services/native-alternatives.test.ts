@@ -174,6 +174,8 @@ describe('findNativeAlternative', () => {
       ['an item that builds binary data', `return { json: {}, binary: { file: { data: $json.base64, mimeType: 'text/plain' } } };`],
       ['a total spread over mapped items', `const total = items.reduce((s, x) => s + x.json.amount, 0);\nreturn items.map(x => ({ json: { total, id: x.json.id } }));`],
       ['a total next to a lookup', `const total = items.reduce((s, x) => s + x.json.amount, 0);\nreturn [{ json: { total, top: items.find(x => x.json.top) } }];`],
+      ['a second, unreachable return', `return { json: { id: $json.id } };\nreturn $input.all().filter(item => item.json.active);`],
+      ['a reused optional-chained value', `const token = Math?.random();\nreturn { json: { a: token, b: token } };`],
       ['a comparator on different fields', `return items.sort((a, b) => a.json.x - b.json.y);`],
       ['several items per item, flattened', `return $input.all().map(item => [{ json: { id: item.json.id } }, { json: { id: item.json.id } }]).flat();`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],

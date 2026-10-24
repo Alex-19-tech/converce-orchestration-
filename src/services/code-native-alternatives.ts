@@ -330,7 +330,8 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   const nodeReturns = returns.filter(ret => !callbacks.some(callback => contains(callback, ret)));
   returns.length = 0;
   returns.push(...nodeReturns);
-  if (returns.length === 0) return undefined;
+  // Without branching, only the first return runs; a second one is dead code
+  if (returns.length !== 1) return undefined;
   if (reusesComputedVariable(program, inits)) return undefined;
 
   /**
@@ -697,7 +698,11 @@ function isJoined(call: AstNode, program: AstNode): boolean {
  */
 function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): boolean {
   const computed = new Set<string>();
-  for (const [name, init] of inits) if (COMPUTED_INITIALIZERS.has(init.type)) computed.add(name);
+  for (const [name, init] of inits) {
+    // Math?.random() is a ChainExpression around the call
+    const value = init.type === 'ChainExpression' ? init.expression : init;
+    if (COMPUTED_INITIALIZERS.has(value.type)) computed.add(name);
+  }
   if (computed.size === 0) return false;
   const uses = new Map<string, number>();
   walk(program, (node, parent) => {
