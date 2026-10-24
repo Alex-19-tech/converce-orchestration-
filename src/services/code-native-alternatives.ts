@@ -245,12 +245,6 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
       case 'Property':
         // { [key]: value } builds a field name at runtime; getters and methods are code
         if ((node.computed && node.key.type !== 'Literal') || node.kind !== 'init' || node.method) disqualified = true;
-        // { json, pairedItem }: linking outputs to chosen inputs, which a node would undo.
-        // A pairedItem field inside json is ordinary data.
-        if (keyName(node) === 'pairedItem' && parent?.type === 'ObjectExpression' &&
-            parent.properties.some((sibling: AstNode) => keyName(sibling) === 'json')) {
-          disqualified = true;
-        }
         break;
       case 'MemberExpression':
         // Binary data, and lookups by a computed key (table[$json.code]), need code
@@ -358,6 +352,18 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   });
   if (!returnShapesOk) return undefined;
 
+  // Returned or mapped items with { json, pairedItem } link outputs to chosen inputs,
+  // which a node would undo. (A pairedItem field inside json is ordinary data.)
+  const itemObjects = [
+    ...returns.flatMap(ret => {
+      const value = resolve(ret.argument);
+      return value?.type === 'ArrayExpression' ? value.elements : [value];
+    }),
+    ...(methods.get('map') ?? []).map(call => call.arguments[0]?.type === 'ArrowFunctionExpression'
+      ? callbackResult(call.arguments[0]) : undefined)
+  ];
+  if (itemObjects.some(isPairedItem)) return undefined;
+
   if (httpCalls > 0) {
     // One request whose response is what the node returns; run once for all items,
     // it is one request
@@ -365,15 +371,21 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     return httpCalls === 1 && methods.size === 0 && returnsResponse ? result('httpRequest', !perItem) : undefined;
   }
 
+  /** Array-method calls other than `call` and the calls inside its callback */
+  const otherCalls = (call: AstNode) => [...allCalls].filter(other => other !== call && !contains(call.arguments[0], other));
+
   for (const call of callsOnItems('filter')) {
     const callback = call.arguments[0];
     if (!returnedAsItems(call) || callback?.type !== 'ArrowFunctionExpression') continue;
+    // Another list call (const ignored = $json.tags.sort()) would be lost
+    if (otherCalls(call).length > 0) return undefined;
     // filter((item, index, all) => all.findIndex(...) === index) removes duplicates
     if (callback.params.length === 3) return isDedupeCallback(callback) ? result('removeDuplicates') : undefined;
     return callback.params.length === 1 && isSimpleCondition(callback) ? result('filter') : undefined;
   }
   for (const call of callsOnItems('sort')) {
     const callback = call.arguments[0];
+    if (otherCalls(call).length > 0) return undefined;
     if (returnedAsItems(call) && callback?.params?.length === 2 && isSimpleCondition(callback)) return result('sort');
   }
   if (methods.has('sort') || methods.has('filter')) return undefined;
@@ -481,7 +493,25 @@ function isDedupeCallback(callback: AstNode): boolean {
   // The inner predicate says the two items have equal fields: other.json.id === item.json.id
   const inner = lookup.arguments[0];
   if (inner?.type !== 'ArrowFunctionExpression' || inner.params.length !== 1) return false;
-  return isFieldEquality(callbackResult(inner), inner.params[0].name, item);
+  // all.findIndex(item => item.json.id === item.json.id) compares an item with itself
+  const other = inner.params[0].name;
+  if ([item, index, all].includes(other)) return false;
+  return isFieldEquality(callbackResult(inner), other, item);
+}
+
+/** Whether `node` is `target` or contains it */
+function contains(node: AstNode | undefined, target: AstNode): boolean {
+  if (!node) return false;
+  let found = false;
+  walk(node, (child) => { if (child === target) found = true; });
+  return found;
+}
+
+/** { json: ..., pairedItem: ... } */
+function isPairedItem(node: AstNode | undefined): boolean {
+  if (node?.type !== 'ObjectExpression') return false;
+  const keys = node.properties.map(keyName);
+  return keys.includes('json') && keys.includes('pairedItem');
 }
 
 /** item.json.id or item.json: one field, or the whole data, of the callback's item */
@@ -643,13 +673,18 @@ function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): 
  */
 function isInputField(node: AstNode | undefined): boolean {
   if (node?.type !== 'MemberExpression') return false;
-  let owner: AstNode = node;
-  while (owner.type === 'MemberExpression' && propertyName(owner) !== 'json') owner = owner.object;
-  if (owner.type === 'Identifier') return owner.name === '$json';
-  if (owner.type !== 'MemberExpression') return false;
-  const item = owner.object; // what .json is read from
-  if (isInputItem(item)) return true;
-  if (item.type === 'CallExpression' && propertyName(item.callee) === 'first' && isIdentifier(item.callee.object, '$input')) return true;
-  return item.type === 'MemberExpression' && item.computed && item.property.type === 'Literal' && item.property.value === 0 &&
-    (isIdentifier(item.object, 'items') || isItemsSource(item.object));
+  if (isIdentifier(rootOf(node), '$json')) return true;
+  // Find the .json read straight off an item accessor; a field named json deeper down is data
+  for (let current: AstNode = node; current.type === 'MemberExpression'; current = current.object) {
+    if (current !== node && propertyName(current) === 'json' && isFirstOrCurrentItem(current.object)) return true;
+  }
+  return false;
+}
+
+/** $input.item, $input.first(), items[0] or $input.all()[0] */
+function isFirstOrCurrentItem(node: AstNode): boolean {
+  if (isInputItem(node)) return true;
+  if (node.type === 'CallExpression' && propertyName(node.callee) === 'first' && isIdentifier(node.callee.object, '$input')) return true;
+  return node.type === 'MemberExpression' && node.computed && node.property.type === 'Literal' && node.property.value === 0 &&
+    isItemsSource(node.object);
 }

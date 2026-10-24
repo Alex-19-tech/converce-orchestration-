@@ -52,8 +52,13 @@ describe('findNativeAlternative', () => {
       expect(kindOf(`return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name));`)).toBe('sort');
     });
 
-    it('Edit Fields when the item data holds a field named pairedItem', () => {
+    it('Edit Fields when the item data holds fields named json and pairedItem', () => {
       expect(kindOf(`return items.map(item => ({ json: { id: item.json.id, pairedItem: item.json.ref } }));`)).toBe('editFields');
+      expect(findNativeAlternative(`return { json: { json: 'payload', pairedItem: 7 } };`, 'runOnceForEachItem')?.kind).toBe('editFields');
+    });
+
+    it('Split Out for a list under a data field named json', () => {
+      expect(kindOf(`return $json.json.rows.map(row => ({ json: row }));`)).toBe('splitOut');
     });
 
     it('Filter for items kept by a condition on the item', () => {
@@ -145,6 +150,8 @@ describe('findNativeAlternative', () => {
       ['objects of renamed fields collected (Aggregate collects fields as they are)', `return [{ json: { values: $input.all().map(item => ({ renamed: item.json.id })) } }];`],
       ['a list of another item', `return items[2].json.rows.map(row => ({ json: row }));`],
       ['outputs linked to a chosen input', `return items.map(item => ({ json: { id: item.json.id }, pairedItem: { item: 1 } }));`],
+      ['a dedupe whose inner item shadows the outer one', `return items.filter((item, i, all) => all.findIndex(item => item.json.id === item.json.id) === i);`],
+      ['a list sorted in place next to a filter', `const ignored = $input.first().json.tags.sort();\nreturn $input.all().filter(item => item.json.active);`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],
       ['a multi-statement callback', `return $input.all().map(item => { const t = item.json.title; return { json: { t } }; });`],
     ])('%s', (_label, code) => {
