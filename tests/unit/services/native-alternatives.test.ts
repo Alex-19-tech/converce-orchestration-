@@ -19,7 +19,6 @@ describe('findNativeAlternative', () => {
       ['fields from other nodes', `return { id: $('Create').first().json.id, task: 'Ask for a budget' };`],
       ['items mapped to new fields', `return $input.all().map(item => ({ json: { title: item.json.metadata?.title, url: item.json.url } }));`],
       ['the current item spread with an extra field', `return { json: { ...$json, processedAt: new Date().toISOString() } };`],
-      ['item texts joined into one message', `const lines = $input.all().map(item => item.json.title).join('\\n');\nreturn [{ json: { text: lines } }];`],
     ])('Edit Fields for %s', (_label, code) => {
       expect(kindOf(code)).toBe('editFields');
     });
@@ -29,6 +28,11 @@ describe('findNativeAlternative', () => {
       expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'editFields', executeOnce: false });
       // Run once for all items, $json and $input.item are the first item only
       expect(findNativeAlternative(code, 'runOnceForAllItems')).toBeUndefined();
+    });
+
+    it('Execute Once only when the code reads no input item past the first', () => {
+      expect(findNativeAlternative(`return { json: { a: $input.first().json.a, b: items[0].json.b } };`)).toMatchObject({ kind: 'editFields', executeOnce: true });
+      expect(findNativeAlternative(`const all = $input.all();\nreturn { json: { a: all[0].json.a } };`)).toMatchObject({ kind: 'editFields', executeOnce: true });
     });
 
     it('Edit Fields with Execute Once when one item is built from all items', () => {
@@ -176,6 +180,10 @@ describe('findNativeAlternative', () => {
       ['a total next to a lookup', `const total = items.reduce((s, x) => s + x.json.amount, 0);\nreturn [{ json: { total, top: items.find(x => x.json.top) } }];`],
       ['a second, unreachable return', `return { json: { id: $json.id } };\nreturn $input.all().filter(item => item.json.active);`],
       ['a reused optional-chained value', `const token = Math?.random();\nreturn { json: { a: token, b: token } };`],
+      ['texts of all items joined into one item (Execute Once sees the first item only)', `const lines = $input.all().map(item => item.json.title).join('\\n');\nreturn [{ json: { text: lines } }];`],
+      ['a count of all items in one item', `return { json: { count: $input.all().length } };`],
+      ['the last item read into one item', `return { json: { last: $input.last().json.id } };`],
+      ['a request body built from all items', `const response = await this.helpers.httpRequest({ method: 'POST', url: 'https://example.com', body: { ids: items.map(i => i.json.id) } });\nreturn [{ json: response }];`],
       ['a comparator on different fields', `return items.sort((a, b) => a.json.x - b.json.y);`],
       ['several items per item, flattened', `return $input.all().map(item => [{ json: { id: item.json.id } }, { json: { id: item.json.id } }]).flat();`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],

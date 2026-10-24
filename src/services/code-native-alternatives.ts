@@ -350,8 +350,11 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   /** The call's result is what the node returns as its items. */
   const returnedAsItems = (call: AstNode) => returns.some(ret => resolve(ret.argument) === call);
   const callsOnItems = (method: string) => (methods.get(method) ?? []).filter(call => isItems(call.callee.object));
-  const result = (kind: NativeAlternativeKind, executeOnce = false): NativeAlternative =>
-    ({ kind, ...ALTERNATIVES[kind], executeOnce });
+  const readsWholeInput = readsBeyondFirstItem(program, inits);
+  // With "Execute Once" n8n hands the node only the first input item, so a suggestion
+  // that needs it cannot stand in for code that reads the other items too.
+  const result = (kind: NativeAlternativeKind, executeOnce = false): NativeAlternative | undefined =>
+    executeOnce && readsWholeInput ? undefined : { kind, ...ALTERNATIVES[kind], executeOnce };
 
   // What a node can return: one object (one item), a list of one object, or the
   // result of the array method that decides the suggestion. Anything else
@@ -538,6 +541,33 @@ function isDedupeCallback(callback: AstNode): boolean {
   const other = inner.params[0].name;
   if ([item, index, all].includes(other)) return false;
   return isFieldEquality(callbackResult(inner), other, item);
+}
+
+/**
+ * Whether the code reads input items past the first: $input.all() or items used as a
+ * list, or $input.last(). items[0], $input.first(), $json and other nodes' items are
+ * all still there when the node runs once.
+ */
+function readsBeyondFirstItem(program: AstNode, inits: Map<string, AstNode>): boolean {
+  const aliases = new Set([...inits].filter(([, init]) => isItemsSource(init)).map(([name]) => name));
+  let reads = false;
+  walk(program, (node, parent) => {
+    if (reads) return;
+    if (node.type === 'CallExpression' && propertyName(node.callee) === 'last' && isIdentifier(node.callee.object, '$input')) {
+      reads = true;
+      return;
+    }
+    const isList = isItemsSource(node) || (node.type === 'Identifier' && aliases.has(node.name));
+    if (!isList || isPropertyName(node, parent)) return;
+    // const items = $input.all() is checked through its uses
+    if (parent?.type === 'VariableDeclarator' && parent.init === node) return;
+    if (parent?.type === 'VariableDeclarator' && parent.id === node) return;
+    // items[0]: the first item
+    const firstItem = parent?.type === 'MemberExpression' && parent.object === node && parent.computed &&
+      parent.property.type === 'Literal' && parent.property.value === 0;
+    if (!firstItem) reads = true;
+  });
+  return reads;
 }
 
 /** Whether `node` is `target` or contains it */
