@@ -21,6 +21,7 @@ import { validateConditionNodeStructure } from './n8n-validation';
 import { checkNodeGroups } from './node-groups';
 import { ToolVariantGenerator } from './tool-variant-generator';
 import { isDeprecatedNodeVersion, deprecatedNodeMessage, deprecatedNodeReplacementHint } from './deprecated-nodes';
+import { findNativeAlternative } from './code-native-alternatives';
 const logger = new Logger({ prefix: '[WorkflowValidator]' });
 
 /**
@@ -44,6 +45,17 @@ export const VALID_CONNECTION_TYPES = new Set<string>([
   'ai_retriever',
   'ai_reranker',
 ]);
+
+/**
+ * Credential types any HTTP API can use (httpHeaderAuth, httpMultipleHeadersAuth,
+ * oAuth2Api, ...); they say nothing about a native node.
+ */
+function isGenericCredentialType(type: string): boolean {
+  return type.startsWith('http') || ['oAuth1Api', 'oAuth2Api', 'jwtAuth'].includes(type);
+}
+
+/** Credential type -> native node names, computed once per repository. */
+const ACTION_NODES_BY_CREDENTIAL = new WeakMap<object, Map<string, string[]>>();
 
 interface WorkflowNode {
   id: string;
@@ -901,6 +913,9 @@ export class WorkflowValidator {
           });
         });
 
+        this.checkNativeAlternative(node, profile, result);
+        this.checkHttpRequestCredential(node, profile, result);
+
         // The config validator above already runs the operator checks, but it keeps one
         // error per property; this direct call reports every operator, skipping the one the
         // config validator already surfaced so nothing appears twice.
@@ -1471,6 +1486,76 @@ export class WorkflowValidator {
    */
   private isAdvisoryProfile(profile: string): boolean {
     return profile === 'ai-friendly' || profile === 'strict';
+  }
+
+  /**
+   * A short JavaScript Code node whose whole job a native node does (map fields,
+   * collect values, split a list, sort, ...). A warning under the advisory
+   * profiles, a suggestion under runtime, nothing under minimal. Notes starting
+   * with "Why Code:" opt the node out.
+   */
+  private checkNativeAlternative(node: WorkflowNode, profile: string, result: WorkflowValidationResult): void {
+    if (profile === 'minimal' || node.type !== 'n8n-nodes-base.code') return;
+    const parameters = node.parameters ?? {};
+    if ((parameters.language ?? 'javaScript') !== 'javaScript') return;
+    if (typeof node.notes === 'string' && /^\s*why code:/i.test(node.notes)) return;
+
+    const alternative = findNativeAlternative(parameters.jsCode, parameters.mode);
+    if (!alternative) return;
+
+    // A Code node set to execute once sees only its first input item; so must the native node
+    const runOnce = alternative.executeOnce || node.executeOnce === true ? ' with its "Execute Once" setting on' : '';
+    const nativeNode = `the ${alternative.node} node (${alternative.nodeType})${runOnce} does this without code.`;
+    const message = `Code node "${node.name}" only ${alternative.does}. ` +
+      (alternative.when ? `If ${alternative.when}, ${nativeNode}` : nativeNode.charAt(0).toUpperCase() + nativeNode.slice(1)) +
+      ' If this needs a Code node, start its notes with "Why Code:" and the reason.';
+    if (this.isAdvisoryProfile(profile)) {
+      result.warnings.push({ type: 'warning', nodeId: node.id, nodeName: node.name, message, code: 'NATIVE_ALTERNATIVE' });
+    } else {
+      result.suggestions.push(message);
+    }
+  }
+
+  /**
+   * An HTTP Request node signed with a service credential that a native node
+   * uses: point at that node, unless it lacks the operation. A suggestion under
+   * the advisory profiles only: the credential says nothing about whether the
+   * node covers the endpoint.
+   */
+  private checkHttpRequestCredential(node: WorkflowNode, profile: string, result: WorkflowValidationResult): void {
+    if (!this.isAdvisoryProfile(profile) || node.type !== 'n8n-nodes-base.httpRequest') return;
+    const parameters = node.parameters ?? {};
+    const credentialType = parameters.nodeCredentialType;
+    if (parameters.authentication !== 'predefinedCredentialType' || typeof credentialType !== 'string') return;
+    if (isGenericCredentialType(credentialType)) return;
+
+    const nodes = this.actionNodesByCredential()?.get(credentialType);
+    // A credential shared by many nodes (aws, googleApi) does not say which node fits
+    if (!nodes || nodes.length === 0 || nodes.length > 3) return;
+
+    const names = nodes.join(' or ');
+    result.suggestions.push(
+      `HTTP Request node "${node.name}" uses the ${credentialType} credential of the ${names} node. ` +
+      `Use the ${names} node unless it lacks this operation.`
+    );
+  }
+
+  private actionNodesByCredential(): Map<string, string[]> | undefined {
+    const repository = this.nodeRepository;
+    // Repository stubs may not have this method
+    if (typeof repository.getActionNodesByCredentialType !== 'function') return undefined;
+    let map = ACTION_NODES_BY_CREDENTIAL.get(repository);
+    if (!map) {
+      try {
+        map = repository.getActionNodesByCredentialType();
+      } catch (error) {
+        // A hint must not turn into a node validation failure
+        logger.debug('Could not build the credential map for the HTTP Request hint', error);
+        map = new Map();
+      }
+      ACTION_NODES_BY_CREDENTIAL.set(repository, map);
+    }
+    return map;
   }
 
   /**

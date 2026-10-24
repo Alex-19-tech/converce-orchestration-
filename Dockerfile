@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.npm \
         @modelcontextprotocol/sdk@1.30.0 dotenv@^16.5.0 express@^5.1.0 axios@^1.20.0 \
         n8n-workflow@2.44.2 uuid@^11.1.1 @types/uuid@^10.0.0 \
         openai@^4.77.0 zod@3.25.76 lru-cache@^11.2.1 \
-        undici@^6.29.0
+        undici@^6.29.0 acorn@^8.16.0
 
 # Copy source and build
 COPY src ./src
