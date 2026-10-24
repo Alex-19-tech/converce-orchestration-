@@ -498,6 +498,56 @@ describe('ConfigValidator', () => {
     });
   });
 
+  // ─── Code syntax checks ───────────────────────────────────────────
+
+  describe('code syntax checks', () => {
+    const codeProps = [{ name: 'language', type: 'options' }, { name: 'jsCode', type: 'string' }, { name: 'pythonCode', type: 'string' }];
+    const validatePython = (pythonCode: string) => ConfigValidator.validate('nodes-base.code', { language: 'python', pythonCode }, codeProps);
+    const validateJs = (jsCode: string) => ConfigValidator.validate('nodes-base.code', { language: 'javascript', jsCode }, codeProps);
+    const hasWarning = (result: ValidationResult, text: string) => result.warnings.some(w => w.message.includes(text));
+
+    it('flags a Python control structure without a colon', () => {
+      expect(hasWarning(validatePython('if x == 1\n    return [x]'), 'Missing colon')).toBe(true);
+      expect(hasWarning(validatePython('for item in items\n    pass\nreturn items'), 'Missing colon')).toBe(true);
+      expect(hasWarning(validatePython('if x == 1:\n    return [x]'), 'Missing colon')).toBe(false);
+      expect(hasWarning(validatePython('def run(items):\n    return items'), 'Missing colon')).toBe(false);
+      expect(hasWarning(validatePython('iffy = 1\nreturn [iffy]'), 'Missing colon')).toBe(false);
+    });
+
+    it('handles a long Python control structure line', () => {
+      const start = performance.now();
+      const result = validatePython('if' + ' '.repeat(2_700) + ':');
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(hasWarning(result, 'Missing colon')).toBe(false);
+    });
+
+    it('flags unterminated JavaScript strings', () => {
+      expect(hasWarning(validateJs("const a = 'abc;\nreturn [{json: {a}}];"), 'unterminated string')).toBe(true);
+      expect(hasWarning(validateJs("const a = 'it\\'s';\nreturn [{json: {a}}];"), 'unterminated string')).toBe(false);
+      expect(hasWarning(validateJs('const a = "say \\"hi\\"" + `x`;\nreturn [{json: {a}}];'), 'unterminated string')).toBe(false);
+    });
+
+    it('handles many JavaScript quotes and backslashes', () => {
+      const start = performance.now();
+      validateJs("'\\".repeat(50_000));
+      validateJs('"a'.repeat(50_000));
+      expect(performance.now() - start).toBeLessThan(2000);
+    });
+
+    it('flags a returned plain object', () => {
+      expect(hasWarning(validateJs('const v = $json.a;\nreturn {json: v};'), 'Return value must be an array')).toBe(true);
+      expect(hasWarning(validateJs('const v = $json.a;\nreturn {};'), 'Return value must be an array')).toBe(false);
+      expect(hasWarning(validateJs('const v = $json.a;\nreturn {json: v}'), 'Return value must be an array')).toBe(false);
+    });
+
+    it('handles many return statements', () => {
+      const start = performance.now();
+      const result = validateJs('return {a'.repeat(33_000));
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(hasWarning(result, 'Return value must be an array')).toBe(false);
+    });
+  });
+
   // ─── Special Characters (from edge-cases) ─────────────────────────
 
   describe('special characters and encoding', () => {

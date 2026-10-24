@@ -41,6 +41,9 @@ interface CachedVersion {
 // Cache TTL: 5 minutes - allows for server upgrades without requiring restart
 const VERSION_CACHE_TTL_MS = 5 * 60 * 1000;
 
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound the settings response size.
+const SETTINGS_RESPONSE_MAX_BYTES = 1024 * 1024;
+
 const versionCache = new Map<string, CachedVersion>();
 
 /**
@@ -141,6 +144,7 @@ export async function fetchN8nVersion(
       maxRedirects: 0,
       httpAgent: pinnedAgents?.httpAgent,
       httpsAgent: pinnedAgents?.httpsAgent,
+      maxContentLength: SETTINGS_RESPONSE_MAX_BYTES,
     });
 
     // n8n wraps the settings in a "data" property

@@ -1590,9 +1590,9 @@ export class N8NDocumentationMCPServer {
               coercedAny = true;
             }
           } catch (e) {
+            // SECURITY (GHSA-rqgx-cvr7-hc6x): log metadata only, not the raw value.
             logger.warn(`Failed to parse string→${expectedType} for param "${key}" in tool "${toolName}"`, {
-              error: e instanceof Error ? e.message : String(e),
-              valuePreview: trimmed.substring(0, 200),
+              errorName: e instanceof Error ? e.name : typeof e,
               valueLength: trimmed.length,
             });
           }
@@ -1607,9 +1607,9 @@ export class N8NDocumentationMCPServer {
               coercedAny = true;
             }
           } catch (e) {
+            // SECURITY (GHSA-rqgx-cvr7-hc6x): log metadata only, not the raw value.
             logger.warn(`Failed to parse string→${expectedType} for param "${key}" in tool "${toolName}"`, {
-              error: e instanceof Error ? e.message : String(e),
-              valuePreview: trimmed.substring(0, 200),
+              errorName: e instanceof Error ? e.name : typeof e,
               valueLength: trimmed.length,
             });
           }
@@ -2538,6 +2538,16 @@ export class N8NDocumentationMCPServer {
     const candidateNodes = this.db!.prepare(`
       SELECT * FROM nodes
     `).all() as NodeRow[];
+
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): a query too long to match any node scores nothing
+    const queryLength = query.toLowerCase().length;
+    const maxScorableLength = candidateNodes.reduce((max, node) => Math.max(
+      max,
+      this.getFuzzyQueryLengthLimit(node.display_name.toLowerCase(), node.node_type.toLowerCase())
+    ), 0);
+    if (queryLength > maxScorableLength) {
+      return { query, results: [], totalCount: 0, mode: 'FUZZY' };
+    }
     
     // Calculate fuzzy scores for candidate nodes
     const scoredNodes = candidateNodes.map(node => {
@@ -2603,6 +2613,11 @@ export class N8NDocumentationMCPServer {
     if (displayNameLower === queryLower || nodeTypeClean === queryLower) {
       return 1000;
     }
+
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): skip edit distance when the query is too long to match
+    if (queryLower.length > this.getFuzzyQueryLengthLimit(displayNameLower, nodeTypeClean)) {
+      return 0;
+    }
     
     // Calculate edit distances for different parts
     const nameDistance = this.getEditDistance(queryLower, displayNameLower);
@@ -2610,9 +2625,9 @@ export class N8NDocumentationMCPServer {
     
     // Also check individual words in the display name
     const nameWords = displayNameLower.split(/\s+/);
+    const wordDistances = nameWords.map(word => this.getEditDistance(queryLower, word));
     let minWordDistance = Infinity;
-    for (const word of nameWords) {
-      const distance = this.getEditDistance(queryLower, word);
+    for (const distance of wordDistances) {
       if (distance < minWordDistance) {
         minWordDistance = distance;
       }
@@ -2625,11 +2640,9 @@ export class N8NDocumentationMCPServer {
     let matchedLen = queryLower.length;
     if (minWordDistance === bestDistance) {
       // Find which word matched best
-      for (const word of nameWords) {
-        if (this.getEditDistance(queryLower, word) === minWordDistance) {
-          matchedLen = Math.max(queryLower.length, word.length);
-          break;
-        }
+      const bestWordIndex = wordDistances.indexOf(minWordDistance);
+      if (bestWordIndex !== -1) {
+        matchedLen = Math.max(queryLower.length, nameWords[bestWordIndex].length);
       }
     } else if (typeDistance === bestDistance) {
       matchedLen = Math.max(queryLower.length, nodeTypeClean.length);
@@ -2665,26 +2678,39 @@ export class N8NDocumentationMCPServer {
     return similarity * 300;
   }
   
+  /**
+   * Returns the longest query length that can still reach the FUZZY match
+   * threshold for a node with this display name and type.
+   */
+  private getFuzzyQueryLengthLimit(displayNameLower: string, nodeTypeLower: string): number {
+    const longest = Math.max(displayNameLower.length, nodeTypeLower.length);
+    return Math.max(Math.floor(longest * 1.5), longest + 3);
+  }
+
   private getEditDistance(s1: string, s2: string): number {
-    // Simple Levenshtein distance implementation
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): two-row Levenshtein distance, linear memory
     const m = s1.length;
     const n = s2.length;
-    const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-    
-    for (let i = 0; i <= m; i++) dp[i][0] = i;
-    for (let j = 0; j <= n; j++) dp[0][j] = j;
-    
+    if (m === 0) return n;
+    if (n === 0) return m;
+
+    let prev: number[] = new Array(n + 1);
+    let curr: number[] = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
+
     for (let i = 1; i <= m; i++) {
+      curr[0] = i;
       for (let j = 1; j <= n; j++) {
         if (s1[i - 1] === s2[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1];
+          curr[j] = prev[j - 1];
         } else {
-          dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+          curr[j] = 1 + Math.min(prev[j], curr[j - 1], prev[j - 1]);
         }
       }
+      [prev, curr] = [curr, prev];
     }
-    
-    return dp[m][n];
+
+    return prev[n];
   }
   
   private async searchNodesLIKE(

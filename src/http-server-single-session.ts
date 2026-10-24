@@ -1153,7 +1153,8 @@ export class SingleSessionHTTPServer {
     const app = express();
     
     // Create JSON parser middleware for endpoints that need it
-    const jsonParser = express.json({ limit: '10mb' });
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): no request-body decompression.
+    const jsonParser = express.json({ limit: '10mb', inflate: false });
     
     // Configure trust proxy for correct IP logging behind reverse proxies
     const trustProxy = process.env.TRUST_PROXY ? Number(process.env.TRUST_PROXY) : 0;
@@ -1698,6 +1699,16 @@ export class SingleSessionHTTPServer {
     
     // Error handler
     app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+      if (!res.headersSent && err?.type === 'encoding.unsupported') {
+        logger.debug('Rejected request body with a Content-Encoding');
+        res.status(415).json({
+          jsonrpc: '2.0',
+          error: { code: -32600, message: 'Content-Encoding is not supported; send an uncompressed body' },
+          id: null
+        });
+        return;
+      }
+
       logger.error('Express error handler:', err);
       
       if (!res.headersSent) {

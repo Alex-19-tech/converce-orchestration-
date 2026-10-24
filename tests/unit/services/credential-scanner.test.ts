@@ -535,6 +535,26 @@ describe('credential-scanner', () => {
   // Pattern completeness sanity check
   // ===========================================================================
 
+  describe('long input', () => {
+    const cases: Array<{ name: string; filler: string; secret: string; label: string }> = [
+      { name: 'dotted runs', filler: 'a.'.repeat(40_000), secret: 'jane.doe@example.com', label: 'email' },
+      { name: 'repeated token prefixes', filler: 'eyJ'.repeat(30_000), secret: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fw', label: 'jwt_token' },
+      { name: 'repeated URL schemes', filler: 'http://x:'.repeat(24_000), secret: 'postgres://admin:hunter2@db.example.com:5432/app', label: 'url_with_auth' },
+    ];
+
+    for (const { name, filler, secret, label } of cases) {
+      it(`handles long ${name} and still finds a later match`, () => {
+        const base = makeWorkflow({ value: `${filler} ${secret}` });
+        const wf = { ...base, nodes: [{ ...base.nodes[0], notes: filler }] };
+        const start = performance.now();
+        const detections = scanWorkflow(wf);
+        expect(performance.now() - start).toBeLessThan(2000);
+        const hit = detections.find((d) => d.label === label);
+        expect(hit?.maskedSnippet).toBe(maskSecret(secret));
+      });
+    }
+  });
+
   describe('pattern definitions', () => {
     it('should have at least 40 secret patterns defined', () => {
       expect(SECRET_PATTERNS.length).toBeGreaterThanOrEqual(40);

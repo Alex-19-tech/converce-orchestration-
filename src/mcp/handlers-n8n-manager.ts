@@ -3347,6 +3347,80 @@ async function handleNativeWorkflowVersions(
   return labelled;
 }
 
+// Scopes whose API key n8n accepted recently, mapped to when that check expires.
+const KEY_CHECK_TTL_MS = 60_000;
+const KEY_CHECK_MAX_ENTRIES = 1000;
+const acceptedKeyScopes = new Map<string, number>();
+
+/**
+ * Confirm that n8n currently accepts the API key behind a local version scope.
+ * Returns null when it does, or the failure response to send instead.
+ */
+async function checkScopeKeyAccepted(
+  scopeId: string,
+  client: N8nApiClient | null,
+  workflowId?: string
+): Promise<McpToolResponse | null> {
+  if (!client) {
+    return {
+      success: false,
+      code: 'NOT_CONFIGURED',
+      error: 'n8n API not configured for this context, so local version history is not available. Provide the n8n API URL and key for this instance.'
+    };
+  }
+
+  const now = Date.now();
+  const expiresAt = acceptedKeyScopes.get(scopeId);
+  if (expiresAt !== undefined && expiresAt > now) {
+    return null;
+  }
+  acceptedKeyScopes.delete(scopeId);
+
+  const unauthorized: McpToolResponse = {
+    success: false,
+    code: 'UNAUTHORIZED',
+    error: 'n8n did not accept this API key, so local version history is not available. Check that the key is valid and can read workflows on this n8n instance, then try again.'
+  };
+  const unavailable: McpToolResponse = {
+    success: false,
+    code: 'N8N_UNAVAILABLE',
+    error: 'n8n could not be reached to confirm this API key, so local version history is unavailable until it is. Check that n8n is running and reachable, then try again.'
+  };
+  const statusOf = (error: unknown) => (error instanceof N8nApiError ? error.statusCode : undefined);
+
+  try {
+    await client.listWorkflows({ limit: 1 });
+  } catch (error) {
+    const status = statusOf(error);
+    if (status === 401) return unauthorized;
+    if (status !== 403) return unavailable;
+    // A key without list access may still read the named workflow; accept that
+    // for this request only. workflowId is passed only for modes it bounds.
+    if (!workflowId) return unauthorized;
+    try {
+      await client.getWorkflow(workflowId);
+      return null;
+    } catch (fallbackError) {
+      const fallbackStatus = statusOf(fallbackError);
+      return fallbackStatus !== undefined && fallbackStatus < 500 && fallbackStatus !== 429
+        ? unauthorized
+        : unavailable;
+    }
+  }
+
+  if (acceptedKeyScopes.size >= KEY_CHECK_MAX_ENTRIES) {
+    for (const [scope, expiry] of acceptedKeyScopes) {
+      if (expiry <= now) acceptedKeyScopes.delete(scope);
+    }
+    if (acceptedKeyScopes.size >= KEY_CHECK_MAX_ENTRIES) {
+      const oldest = acceptedKeyScopes.keys().next().value;
+      if (oldest !== undefined) acceptedKeyScopes.delete(oldest);
+    }
+  }
+  acceptedKeyScopes.set(scopeId, now + KEY_CHECK_TTL_MS);
+  return null;
+}
+
 /**
  * `source: local` — the snapshots n8n-mcp takes before it changes a workflow.
  * Numbered per workflow, scoped to the instance, and independent of the n8n
@@ -3365,7 +3439,17 @@ async function handleLocalWorkflowVersions(
   // worked, because they read the local version store instead. Multi-tenant isolation is
   // enforced inside getN8nApiClient and by the scope check above, not by this ternary.
   const client = getN8nApiClient(context);
-  const versioningService = new WorkflowVersioningService(repository, client || undefined, getInstanceScopeId(context));
+  const scopeId = getInstanceScopeId(context);
+
+  // SECURITY (GHSA-74hp-7jv7-vx4j): serve a tenant scope only while n8n accepts its key.
+  if (scopeId !== '') {
+    const workflowBound = input.mode === 'list' || input.mode === 'prune' || input.mode === 'diff' ||
+      input.mode === 'rollback' || (input.mode === 'delete' && input.deleteAll === true);
+    const refused = await checkScopeKeyAccepted(scopeId, client, workflowBound ? input.workflowId : undefined);
+    if (refused) return refused;
+  }
+
+  const versioningService = new WorkflowVersioningService(repository, client || undefined, scopeId);
 
   switch (input.mode) {
     case 'list': {
@@ -3425,6 +3509,18 @@ async function handleLocalWorkflowVersions(
           success: false,
           error: 'n8n API not configured. Cannot perform rollback without API access.'
         };
+      }
+
+      // SECURITY (GHSA-74hp-7jv7-vx4j): a scoped rollback restores only this workflow's snapshots.
+      if (scopeId !== '' && versionId !== undefined) {
+        const target = await versioningService.getVersion(versionId);
+        if (!target || target.workflowId !== input.workflowId) {
+          return {
+            success: false,
+            code: 'INVALID_ARGS',
+            error: `Version ${versionId} not found for workflow ${input.workflowId}`
+          };
+        }
       }
 
       const result = await versioningService.restoreVersion(

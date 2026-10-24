@@ -461,6 +461,42 @@ describe('TelemetryEventTracker', () => {
   });
 
   describe('trackValidationDetails()', () => {
+    beforeEach(async () => {
+      // The workflow sanitizer is auto-mocked in this file; these tests need
+      // its real node-name and string redaction.
+      const actual = await vi.importActual<typeof import('../../../src/telemetry/workflow-sanitizer')>(
+        '../../../src/telemetry/workflow-sanitizer'
+      );
+      vi.mocked(WorkflowSanitizer.sanitizeNodeName).mockImplementation(
+        (name: string) => actual.WorkflowSanitizer.sanitizeNodeName(name)
+      );
+      vi.mocked(WorkflowSanitizer.sanitizeTelemetryObject).mockImplementation(
+        (value: any) => actual.WorkflowSanitizer.sanitizeTelemetryObject(value)
+      );
+    });
+
+    it('redacts email addresses and phone numbers in node names', () => {
+      eventTracker.trackValidationDetails('Notify jane.doe@example.test +1 415 555 0134', 'validation_error', {});
+
+      const nodeType = eventTracker.getEventQueue()[0].properties.nodeType;
+      expect(nodeType).not.toContain('jane');
+      expect(nodeType).not.toContain('example');
+      expect(nodeType).not.toContain('555');
+    });
+
+    it('redacts personal data in detail messages that quote a node name', () => {
+      eventTracker.trackValidationDetails('workflow', 'validation_error', {
+        message: 'Connection from non-existent node: "Ghost john.roe@example.test 555-867-5309"',
+        nodeCount: 2,
+      });
+
+      const details = eventTracker.getEventQueue()[0].properties.details;
+      expect(details.message).toContain('Connection from non-existent node');
+      expect(details.message).not.toContain('john.roe');
+      expect(details.message).not.toContain('867-5309');
+      expect(details.nodeCount).toBe(2);
+    });
+
     it('should track validation error details', () => {
       const details = { field: 'url', value: 'invalid' };
       eventTracker.trackValidationDetails('nodes-base.httpRequest', 'required_field_missing', details);

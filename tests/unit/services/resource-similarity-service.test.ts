@@ -2,7 +2,7 @@
  * Tests for ResourceSimilarityService
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ResourceSimilarityService } from '../../../src/services/resource-similarity-service';
 import { NodeRepository } from '../../../src/database/node-repository';
 import { createTestDatabase } from '../../utils/database-utils';
@@ -283,6 +283,52 @@ describe('ResourceSimilarityService', () => {
       );
 
       expect(suggestions).toBeDefined();
+    });
+  });
+
+  describe('input and cache bounds', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('handles a long resource value', () => {
+      const start = Date.now();
+      const results = Array.from({ length: 5 }, (_, i) =>
+        service.findSimilarResources('nodes-base.googleDrive', 'z'.repeat(3_000_000) + i, 5)
+      );
+      expect(Date.now() - start).toBeLessThan(2000);
+      expect(results.every(suggestions => suggestions.length === 0)).toBe(true);
+    });
+
+    it('returns no suggestions for values longer than any real name', () => {
+      expect(service.findSimilarResources('nodes-base.googleDrive', 'file' + 'x'.repeat(200), 5)).toEqual([]);
+    });
+
+    it('does not cache over-long resource values', () => {
+      service.findSimilarResources('nodes-base.googleDrive', 'r'.repeat(10_000), 5);
+
+      const keys = [...(service as any).suggestionCache.keys()];
+      expect(keys.every((key: string) => key.length <= 512)).toBe(true);
+    });
+
+    it('caps the number of cached suggestions', () => {
+      // Keep the probabilistic cleanup from running so only the size cap applies.
+      vi.spyOn(Math, 'random').mockReturnValue(0.99);
+
+      for (let i = 0; i < 300; i++) {
+        service.findSimilarResources('nodes-base.googleDrive', `fil${i}`, 5);
+      }
+
+      expect((service as any).suggestionCache.size).toBeLessThanOrEqual(100);
+    });
+
+    it('keeps edit distances unchanged', () => {
+      const distance = (a: string, b: string) => (service as any).levenshteinDistance(a, b);
+      expect(distance('kitten', 'sitting')).toBe(3);
+      expect(distance('flie', 'file')).toBe(2);
+      expect(distance('folder', 'file')).toBe(3);
+      expect(distance('', 'abc')).toBe(3);
+      expect(distance('abc', '')).toBe(3);
     });
   });
 });

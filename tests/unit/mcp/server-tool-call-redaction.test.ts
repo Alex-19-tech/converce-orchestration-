@@ -75,6 +75,26 @@ describe('server tool-call log redaction (GHSA-wg4g-395p-mqv3)', () => {
     expect(allLogPayloads()).not.toContain('DEMO_SECRET');
   });
 
+  it('logs only metadata when a stringified object or array fails to parse', () => {
+    server.callCoerce('validate_node', {
+      nodeType: 'nodes-base.slack',
+      config: `{"header": "${SECRET}"`,
+    });
+    server.callCoerce('n8n_update_partial_workflow', {
+      id: '1',
+      operations: `[{"value": "${SECRET}"`,
+    });
+
+    const warnCalls = (logger.warn as any).mock.calls.filter((c: any[]) =>
+      typeof c[0] === 'string' && c[0].startsWith('Failed to parse string')
+    );
+    expect(warnCalls).toHaveLength(2);
+    for (const call of warnCalls) {
+      expect(call[1]).toEqual({ errorName: 'SyntaxError', valueLength: expect.any(Number) });
+    }
+    expect(allLogPayloads()).not.toContain('DEMO_SECRET');
+  });
+
   it('does not leak secret values from validateExtractedArgs type-mismatch path', () => {
     server.callValidateExtracted('search_nodes', {
       query: 123 as any,

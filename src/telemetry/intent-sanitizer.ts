@@ -3,12 +3,15 @@
  * Ensures privacy by masking sensitive information
  */
 
+import { redactEmailAddresses } from './email-redaction';
+
 /**
  * Patterns for detecting and removing PII
  */
 const PII_PATTERNS = {
   // Email addresses
-  email: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/gi,
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): bound the local part.
+  email: /\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/gi,
 
   // URLs with domains
   url: /https?:\/\/[^\s]+/gi,
@@ -47,6 +50,11 @@ const COMPANY_PATTERNS = {
   businessContext: /\b(?:company|organization|client|customer)\s+(?:named?|called)\s+\w+/gi,
 };
 
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound the input size.
+const MAX_INTENT_LENGTH = 10_000;
+
+const EMAIL_DOMAIN = /[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/iy;
+
 /**
  * Sanitizes user intent by removing PII and sensitive information
  */
@@ -58,11 +66,14 @@ export class IntentSanitizer {
     if (!intent) {
       return intent;
     }
+    if (intent.length > MAX_INTENT_LENGTH) {
+      return '[TRUNCATED]';
+    }
 
     let sanitized = intent;
 
     // Remove email addresses
-    sanitized = sanitized.replace(PII_PATTERNS.email, '[EMAIL]');
+    sanitized = redactEmailAddresses(sanitized, EMAIL_DOMAIN, '[EMAIL]');
 
     // Remove URLs
     sanitized = sanitized.replace(PII_PATTERNS.url, '[URL]');

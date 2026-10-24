@@ -7,7 +7,7 @@
 import { TelemetryEvent, WorkflowTelemetry, WorkflowMutationRecord } from './telemetry-types';
 import { WorkflowSanitizer } from './workflow-sanitizer';
 import { TelemetryRateLimiter } from './rate-limiter';
-import { TelemetryEventValidator } from './event-validator';
+import { TelemetryEventValidator, sanitizeEventString } from './event-validator';
 import { TelemetryError, TelemetryErrorType } from './telemetry-error';
 import { logger } from '../utils/logger';
 import { existsSync, readFileSync } from 'fs';
@@ -244,11 +244,22 @@ export class TelemetryEventTracker {
   trackValidationDetails(nodeType: string, errorType: string, details: Record<string, any>): void {
     if (!this.isEnabled()) return;
 
+    // SECURITY (GHSA-rqgx-cvr7-hc6x): node names and messages also go through the workflow sanitizer.
+    const sanitize = (value: string) => WorkflowSanitizer.sanitizeTelemetryObject<string>(sanitizeEventString(value));
+    const sanitizedDetails = details && typeof details === 'object'
+      ? Object.fromEntries(Object.entries(details).map(([key, value]) =>
+          [key, typeof value === 'string' ? sanitize(value) : value]))
+      : details;
+    // A name that needs redaction is replaced whole, keeping only its hash suffix.
+    const sanitizedName = WorkflowSanitizer.sanitizeNodeName(nodeType);
+    const safeName = sanitizedName === nodeType
+      ? nodeType
+      : `[REDACTED]${sanitizedName.slice(sanitizedName.lastIndexOf(' #'))}`;
     this.trackEvent('validation_details', {
-      nodeType: nodeType.replace(/[^a-zA-Z0-9_.-]/g, '_'),
+      nodeType: safeName.replace(/[^a-zA-Z0-9_.-]/g, '_'),
       errorType: this.sanitizeErrorType(errorType),
       errorCategory: this.categorizeError(errorType),
-      details
+      details: sanitizedDetails
     });
   }
 

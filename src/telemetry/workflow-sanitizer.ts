@@ -4,6 +4,7 @@
  */
 
 import { createHash } from 'crypto';
+import { redactEmailAddresses } from './email-redaction';
 
 interface WorkflowNode {
   id: string;
@@ -30,7 +31,9 @@ interface SanitizedWorkflow {
 
 interface PatternDefinition {
   pattern: RegExp;
-  placeholder: string;
+  placeholder: string | ((match: string) => string);
+  // Skip the pattern when the string does not contain this text.
+  requires?: string;
 }
 
 export class WorkflowSanitizer {
@@ -38,7 +41,11 @@ export class WorkflowSanitizer {
     // Webhook URLs (replace with placeholder but keep structure) - MUST BE FIRST.
     // The URL stops at whitespace, quotes and brackets so a webhook URL inside
     // code or prose is redacted in place without eating the surrounding syntax.
-    { pattern: /https?:\/\/[^\s"'`<>(){}\[\],;]*?\/webhook(?:s|-test)?\/[^\s"'`<>(){}\[\],;]+/gi, placeholder: '[REDACTED_WEBHOOK]' },
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): match the URL, then test its path.
+    {
+      pattern: /https?:\/\/[^\s"'`<>(){}\[\],;]*/gi,
+      placeholder: (url) => (WorkflowSanitizer.WEBHOOK_PATH.test(url.replace(/^https?:\/\//i, '')) ? '[REDACTED_WEBHOOK]' : url),
+    },
     { pattern: /https?:\/\/[^\s/]+\/hook\/[^\s"'`<>(){}\[\],;]+/gi, placeholder: '[REDACTED_WEBHOOK]' },
     { pattern: /https?:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+/gi, placeholder: '[REDACTED_WEBHOOK]' },
 
@@ -78,7 +85,8 @@ export class WorkflowSanitizer {
     { pattern: /\bBasic\s+(?=[A-Za-z0-9+/]*\d)[A-Za-z0-9+/]{12,}={0,2}/g, placeholder: 'Basic [REDACTED]' },
 
     // Generic JWT (catches Supabase anon + service_role + any other JWT). Three base64url segments, dot-separated.
-    { pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, placeholder: '[REDACTED_JWT]' },
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): find JWTs within dotted tokens.
+    { pattern: /[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/g, placeholder: (token) => WorkflowSanitizer.redactJwts(token), requires: 'eyJ' },
 
     // Supabase secret and publishable keys
     { pattern: /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{20,}\b/g, placeholder: '[REDACTED_SUPABASE_KEY]' },
@@ -121,10 +129,8 @@ export class WorkflowSanitizer {
 
   // PII in free-text node parameters. Applied after UUIDs are shielded: the
   // phone pattern would otherwise match the digit runs inside hex ids.
+  // Emails are redacted first, by redactEmailAddresses.
   private static readonly PII_PATTERNS: PatternDefinition[] = [
-    // The local part is bounded (64 is the RFC limit): unbounded, the class
-    // scanned to the end of every long token run and made the pass quadratic.
-    { pattern: /\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, placeholder: '[REDACTED_EMAIL]' },
     // Lookbehind/lookahead reject word-character and hyphen neighbours so the
     // digit runs inside identifiers (`f0418644027c`) aren't misclassified as
     // phone numbers.
@@ -234,6 +240,27 @@ export class WorkflowSanitizer {
   // A redacted secret keeps its HTTP auth scheme so the header shape survives.
   private static readonly AUTH_SCHEME_PREFIX = /^(Bearer|Basic|Digest)\s+/i;
 
+  // Webhook path inside a URL with its scheme removed.
+  private static readonly WEBHOOK_PATH = /\/webhook(?:s|-test)?\/./i;
+
+  // Last words of a `{ name, value }` parameter name that hold a secret
+  // (`X-Amz-Signature`, `Ocp-Apim-Subscription-Key`); `code` only as the whole
+  // name, since `countryCode` and `statusCode` are data.
+  private static readonly SECRET_PARAM_LAST_WORDS = new Set(['key', 'sig', 'signature']);
+  private static readonly SECRET_PARAM_NAMES = new Set(['code']);
+
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): bound input sizes.
+  private static readonly MAX_STRING_LENGTH = 100_000;
+  private static readonly MAX_KEY_LENGTH = 256;
+  private static readonly MAX_NESTED_WORKFLOW_DEPTH = 3;
+  private static readonly MAX_JSON_DEPTH = 4;
+  private static readonly MAX_JSON_WORK = 1_000_000;
+  private static readonly MAX_JSON_NESTING = 64;
+  private static jsonDepth = 0;
+  private static jsonBudget = 0;
+
+  private static readonly EMAIL_DOMAIN = /[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/y;
+
   /**
    * Sanitize a complete workflow
    */
@@ -305,24 +332,30 @@ export class WorkflowSanitizer {
     if (!Array.isArray(operations)) {
       return this.sanitizeTelemetryObject<T>(operations);
     }
-    const types = this.nodeTypesByKey(workflows);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): one sticky flag per key.
+    const kinds = this.nodeKindsByKey(workflows);
     // The diff engine applies addNode operations before the others, so every
     // added node is known before any edit is classified.
     for (const op of operations) {
       if (op && typeof op === 'object' && op.node && typeof op.node === 'object' && !Array.isArray(op.node)) {
-        this.recordNodeType(types, op.node.id, op.node.name, op.node.type);
+        this.recordNodeKind(kinds, op.node.id, op.node.name, !this.isKnownNonSticky(op.node.type));
       }
     }
     const isContentPath = (path: unknown) =>
       typeof path === 'string' && (path === 'parameters.content' || path.startsWith('parameters.content.'));
     // Content edits are kept only when every node the target could resolve to
     // is known not to be a sticky note; an unknown target counts as sticky.
-    const targetTypes = (op: any): Set<unknown> => {
-      const found = new Set<unknown>();
+    // Returns undefined when no node is known for the target, otherwise
+    // whether any known node may be a sticky note.
+    const targetMaySticky = (op: any): boolean | undefined => {
+      let found: boolean | undefined;
       const keys = [];
       if (typeof op.nodeId === 'string') keys.push(`id:${op.nodeId}`, this.nodeKey(op.nodeId));
       if (typeof op.nodeName === 'string') keys.push(this.nodeKey(op.nodeName));
-      for (const key of keys) for (const type of types.get(key) ?? []) found.add(type);
+      for (const key of keys) {
+        const kind = kinds.get(key);
+        if (kind !== undefined) found = found === true || kind;
+      }
       return found;
     };
     // A batch that changes a node type, or renames through a patch, makes
@@ -341,14 +374,14 @@ export class WorkflowSanitizer {
         return op;
       }
       const { description, ...rest } = op;
-      const resolved = targetTypes(rest);
-      const targetsSticky = uncertain || resolved.size === 0 || [...resolved].some((type) => !this.isKnownNonSticky(type));
+      const resolved = targetMaySticky(rest);
+      const targetsSticky = uncertain || resolved !== false;
       if (rest.updates && typeof rest.updates === 'object' && !Array.isArray(rest.updates) && typeof rest.updates.name === 'string') {
-        for (const type of resolved.size > 0 ? resolved : [undefined]) this.recordNodeType(types, undefined, rest.updates.name, type);
+        this.recordNodeKind(kinds, undefined, rest.updates.name, resolved !== false);
       }
       if (rest.node && typeof rest.node === 'object' && !Array.isArray(rest.node)) {
         const { notes, ...node } = rest.node;
-        this.recordNodeType(types, node.id, node.name, node.type);
+        this.recordNodeKind(kinds, node.id, node.name, !this.isKnownNonSticky(node.type));
         if (this.isStickyType(node.type)) {
           node.parameters = this.withoutContent(node.parameters);
         }
@@ -454,25 +487,27 @@ export class WorkflowSanitizer {
     return `name:${name.replace(/\\/g, '').replace(/\s+/g, ' ').trim().toLowerCase()}`;
   }
 
-  /** Node types known for each id/name key in the given workflows. */
-  private static nodeTypesByKey(workflows: any[]): Map<string, Set<unknown>> {
-    const types = new Map<string, Set<unknown>>();
+  /**
+   * For each id/name key in the given workflows: whether any node known under
+   * it may be a sticky note (its type is not a known non-sticky type).
+   */
+  private static nodeKindsByKey(workflows: any[]): Map<string, boolean> {
+    const kinds = new Map<string, boolean>();
     for (const workflow of workflows) {
       if (!workflow || !Array.isArray(workflow.nodes)) continue;
       for (const node of workflow.nodes) {
-        if (node && typeof node === 'object') this.recordNodeType(types, node.id, node.name, node.type);
+        if (node && typeof node === 'object') this.recordNodeKind(kinds, node.id, node.name, !this.isKnownNonSticky(node.type));
       }
     }
-    return types;
+    return kinds;
   }
 
-  private static recordNodeType(types: Map<string, Set<unknown>>, id: unknown, name: unknown, type: unknown): void {
+  private static recordNodeKind(kinds: Map<string, boolean>, id: unknown, name: unknown, maySticky: boolean): void {
     const keys = [];
     if (typeof id === 'string') keys.push(`id:${id}`, this.nodeKey(id));
     if (typeof name === 'string') keys.push(this.nodeKey(name));
     for (const key of keys) {
-      if (!types.has(key)) types.set(key, new Set());
-      types.get(key)!.add(type);
+      kinds.set(key, kinds.get(key) === true || maySticky);
     }
   }
 
@@ -504,7 +539,7 @@ export class WorkflowSanitizer {
    * suffix derived from the original, so distinct nodes stay distinct and the
    * same node gets the same name in every snapshot.
    */
-  private static sanitizeNodeName(name: string): string {
+  static sanitizeNodeName(name: string): string {
     const sanitized = this.sanitizeString(name);
     if (sanitized === name) {
       return name;
@@ -543,7 +578,7 @@ export class WorkflowSanitizer {
         if (resourceLocatorMode === 'url') {
           kind = 'url';
         } else if (sibling !== undefined) {
-          kind = this.classifyKey(sibling);
+          kind = this.classifyParamName(sibling);
         }
       }
 
@@ -582,8 +617,110 @@ export class WorkflowSanitizer {
    * Sanitize string values
    */
   private static sanitizeString(value: string, redactOpaqueTokens = true): string {
+    if (value.length > this.MAX_STRING_LENGTH) {
+      return '[REDACTED_LONG_STRING]';
+    }
+    const structured = this.sanitizeJsonText(value);
+    if (structured === undefined) {
+      return this.sanitizeText(value, redactOpaqueTokens);
+    }
+    if (structured.length > this.MAX_STRING_LENGTH) {
+      return '[REDACTED_LONG_STRING]';
+    }
+    // Keep the original formatting when the text patterns give the same JSON.
+    const fromStructure = this.sanitizeText(structured, redactOpaqueTokens);
+    const fromText = this.sanitizeText(value, redactOpaqueTokens);
+    return this.sameJson(fromText, fromStructure) ? fromText : fromStructure;
+  }
+
+  /** Whether two JSON texts (optionally `=`-prefixed) hold the same value. */
+  private static sameJson(a: string, b: string): boolean {
+    if (a.startsWith('=') !== b.startsWith('=')) return false;
+    try {
+      const parse = (text: string) => JSON.stringify(JSON.parse(text.startsWith('=') ? text.slice(1) : text));
+      return parse(a) === parse(b);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * SECURITY (GHSA-rqgx-cvr7-hc6x): a string holding a JSON object or array
+   * (optionally after the `=` expression prefix) is parsed and sanitized with
+   * the object rules. Returns the compact re-serialized text; undefined when
+   * the string is not JSON or nothing changed; `[REDACTED_NESTED_JSON]` when
+   * it is JSON beyond the depth or size budget.
+   */
+  private static sanitizeJsonText(value: string): string | undefined {
+    const prefix = value.startsWith('=') ? '=' : '';
+    const body = prefix ? value.slice(1) : value;
+    const trimmed = body.trim();
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if (!((first === '{' && last === '}') || (first === '[' && last === ']'))) {
+      return undefined;
+    }
+    if (this.jsonDepth === 0) {
+      this.jsonBudget = this.MAX_JSON_WORK;
+    }
+    if (body.length > this.jsonBudget) {
+      return prefix + '[REDACTED_NESTED_JSON]';
+    }
+    this.jsonBudget -= body.length;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return undefined;
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      return undefined;
+    }
+    if (this.jsonDepth >= this.MAX_JSON_DEPTH || this.jsonNesting(body) > this.MAX_JSON_NESTING) {
+      return prefix + '[REDACTED_NESTED_JSON]';
+    }
+    this.jsonDepth++;
+    try {
+      const sanitized = this.sanitizeObject(parsed);
+      const output = JSON.stringify(sanitized);
+      return output === JSON.stringify(parsed) ? undefined : prefix + output;
+    } finally {
+      this.jsonDepth--;
+    }
+  }
+
+  /** Deepest bracket nesting in JSON text, counting only up to the limit plus one. */
+  private static jsonNesting(text: string): number {
+    let depth = 0;
+    let max = 0;
+    let inString = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inString) {
+        if (c === '\\') i++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') {
+        inString = true;
+      } else if (c === '{' || c === '[') {
+        depth++;
+        if (depth > max) {
+          max = depth;
+          if (max > this.MAX_JSON_NESTING) return max;
+        }
+      } else if (c === '}' || c === ']') {
+        depth--;
+      }
+    }
+    return max;
+  }
+
+  /** Pattern-based sanitization of one string. */
+  private static sanitizeText(value: string, redactOpaqueTokens: boolean): string {
     // NUL never occurs in workflow JSON and would collide with the UUID shield.
-    let sanitized = this.applyPatterns(value.replace(/\u0000/g, ''), this.SENSITIVE_PATTERNS);
+    let sanitized = this.applyPatterns(
+      this.redactKeyedLiterals(value.replace(/\u0000/g, '')),
+      this.SENSITIVE_PATTERNS
+    );
 
     // Shield the UUIDs that survived the secret patterns; restored at the end.
     const uuids: string[] = [];
@@ -592,7 +729,7 @@ export class WorkflowSanitizer {
       return `\u0000uuid${uuids.length - 1}\u0000`;
     });
 
-    sanitized = this.applyPatterns(sanitized, this.PII_PATTERNS);
+    sanitized = this.applyPatterns(redactEmailAddresses(sanitized, this.EMAIL_DOMAIN, '[REDACTED_EMAIL]'), this.PII_PATTERNS);
 
     // Both fallbacks need a digit; skipping digit-free strings keeps the
     // fallback off long prose and code that cannot contain a match.
@@ -609,10 +746,128 @@ export class WorkflowSanitizer {
 
   private static applyPatterns(value: string, patterns: PatternDefinition[]): string {
     let result = value;
-    for (const { pattern, placeholder } of patterns) {
-      result = result.replace(pattern, placeholder);
+    for (const { pattern, placeholder, requires } of patterns) {
+      if (requires !== undefined && !result.includes(requires)) continue;
+      result = typeof placeholder === 'string'
+        ? result.replace(pattern, placeholder)
+        : result.replace(pattern, placeholder);
     }
     return result;
+  }
+
+  /**
+   * Redact JWTs (`eyJ...` and two more base64url segments of 10+ characters)
+   * inside one dot-joined token.
+   */
+  private static redactJwts(token: string): string {
+    if (!token.includes('eyJ')) return token;
+    const runs = token.split('.');
+    const out: string[] = [];
+    let i = 0;
+    while (i < runs.length) {
+      const run = runs[i];
+      const start = this.jwtStart(run);
+      const third = i + 2 < runs.length ? runs[i + 2] : undefined;
+      const thirdEnd = third === undefined ? -1 : this.lastWordCharEnd(third);
+      if (start >= 0 && run.length - start - 3 >= 10 && third !== undefined &&
+          runs[i + 1].length >= 10 && thirdEnd >= 10) {
+        out.push(run.slice(0, start) + '[REDACTED_JWT]' + third.slice(thirdEnd));
+        i += 3;
+      } else {
+        out.push(run);
+        i += 1;
+      }
+    }
+    return out.join('.');
+  }
+
+  /** First `eyJ` in a base64url run that starts at a word boundary, or -1. */
+  private static jwtStart(run: string): number {
+    for (let at = run.indexOf('eyJ'); at >= 0; at = run.indexOf('eyJ', at + 1)) {
+      if (at === 0 || run[at - 1] === '-') return at;
+    }
+    return -1;
+  }
+
+  /** Length of the run up to and including its last word character. */
+  private static lastWordCharEnd(run: string): number {
+    let end = run.length;
+    while (end > 0 && run[end - 1] === '-') end--;
+    return end;
+  }
+
+  /**
+   * SECURITY (GHSA-rqgx-cvr7-hc6x): redact quoted values under secret keys in
+   * serialized text (`"X-API-Key": "..."` in JSON, `apiKey: '...'` or
+   * `password = "..."` in code).
+   */
+  private static redactKeyedLiterals(text: string): string {
+    if (!/["']/.test(text) || !/[:=]/.test(text)) return text;
+    const n = text.length;
+    // Next unescaped double quote, single quote and line break at or after each index.
+    const nextDouble = new Int32Array(n + 1).fill(n);
+    const nextSingle = new Int32Array(n + 1).fill(n);
+    const nextBreak = new Int32Array(n + 1).fill(n);
+    const escaped = new Uint8Array(n);
+    for (let j = 0, backslashes = 0; j < n; j++) {
+      escaped[j] = backslashes % 2;
+      backslashes = text.charCodeAt(j) === 92 ? backslashes + 1 : 0;
+    }
+    for (let j = n - 1; j >= 0; j--) {
+      const c = text[j];
+      nextDouble[j] = c === '"' && !escaped[j] ? j : nextDouble[j + 1];
+      nextSingle[j] = c === "'" && !escaped[j] ? j : nextSingle[j + 1];
+      nextBreak[j] = c === '\n' || c === '\r' ? j : nextBreak[j + 1];
+    }
+
+    const parts: string[] = [];
+    let copied = 0;
+    let floor = 0;
+    let previous: [number, number] | undefined;
+    for (let i = 0; i < n; ) {
+      const c = text[i];
+      if (c !== '"' && c !== "'") { i++; continue; }
+      const close = (c === '"' ? nextDouble : nextSingle)[i + 1];
+      if (close >= n || close > nextBreak[i + 1]) { i++; continue; }
+      const key = this.keyBefore(text, i, floor, previous);
+      if (key !== undefined && this.classifyKey(key) === 'secret') {
+        parts.push(text.slice(copied, i + 1), String(this.redactSecret(text.slice(i + 1, close))));
+        copied = close;
+      }
+      previous = [i, close + 1];
+      floor = close + 1;
+      i = close + 1;
+    }
+    if (copied === 0) return text;
+    parts.push(text.slice(copied));
+    return parts.join('');
+  }
+
+  /**
+   * The key a quoted value at `start` is assigned to: a quoted key or an
+   * identifier followed by `:` or `=`. Looks back no further than `floor`,
+   * the end of the previous quoted string.
+   */
+  private static keyBefore(text: string, start: number, floor: number, previous: [number, number] | undefined): string | undefined {
+    const isSpace = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+    let j = start - 1;
+    while (j >= floor && isSpace(text[j])) j--;
+    if (j < floor) return undefined;
+    const separator = text[j];
+    if (separator === '=') {
+      const before = text[j - 1];
+      if (j - 1 >= floor && (before === '=' || before === '!' || before === '<' || before === '>')) return undefined;
+    } else if (separator !== ':') {
+      return undefined;
+    }
+    j--;
+    while (j >= floor && isSpace(text[j])) j--;
+    if (previous !== undefined && j === previous[1] - 1 && j === floor - 1) {
+      return text.slice(previous[0] + 1, previous[1] - 1);
+    }
+    const end = j + 1;
+    while (j >= floor && end - j <= 64 && /[\w$.-]/.test(text[j])) j--;
+    return end - j > 1 ? text.slice(j + 1, end) : undefined;
   }
 
   private static redactSecret(value: unknown): unknown {
@@ -643,13 +898,11 @@ export class WorkflowSanitizer {
    * (see sanitizeObject), 'none' leaves the value to the pattern sanitizer.
    */
   private static classifyKey(key: string): 'url' | 'secret' | 'none' {
-    const words = key
-      // `URLs` is the acronym plus a plural, not `UR` + `Ls`.
-      .replace(/([A-Z]{2,})s(?![a-z])/g, '$1S')
-      .split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|[^A-Za-z0-9]+/)
-      // `url2`, `token1`: a trailing number does not change the word.
-      .map((word) => word.toLowerCase().replace(/\d+$/, ''))
-      .filter(Boolean);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): bound key length.
+    if (key.length > this.MAX_KEY_LENGTH) {
+      return 'secret';
+    }
+    const words = this.keyWords(key);
     const joined = words.join('');
     const last = words[words.length - 1];
 
@@ -673,6 +926,32 @@ export class WorkflowSanitizer {
       return 'secret';
     }
     return 'none';
+  }
+
+  /** Words of a key: camelCase, snake_case and kebab-case are split. */
+  private static keyWords(key: string): string[] {
+    return key
+      // `URLs` is the acronym plus a plural, not `UR` + `Ls`.
+      .replace(/(?<![A-Z])([A-Z]{2,})s(?![a-z])/g, '$1S')
+      .split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|[^A-Za-z0-9]+/)
+      // `url2`, `token1`: a trailing number does not change the word.
+      .map((word) => word.toLowerCase().replace(/(?<!\d)\d+$/, ''))
+      .filter(Boolean);
+  }
+
+  /**
+   * SECURITY (GHSA-rqgx-cvr7-hc6x): classify the `name` of a `{ name, value }`
+   * parameter, which also covers names that hold a secret only in that role.
+   */
+  private static classifyParamName(name: string): 'url' | 'secret' | 'none' {
+    const kind = this.classifyKey(name);
+    if (kind !== 'none') return kind;
+    const words = this.keyWords(name);
+    const last = words[words.length - 1];
+    if (last === undefined || this.COUNT_WORDS.has(last)) return 'none';
+    return this.SECRET_PARAM_LAST_WORDS.has(last) || (words.length === 1 && this.SECRET_PARAM_NAMES.has(last))
+      ? 'secret'
+      : 'none';
   }
 
   /**
@@ -734,8 +1013,11 @@ export class WorkflowSanitizer {
    */
   static sanitizeWorkflowRaw(workflow: any): any {
     // Create a deep copy to avoid modifying original
-    const sanitized = JSON.parse(JSON.stringify(workflow));
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): nested versions are sanitized in place.
+    return this.sanitizeWorkflowRawInPlace(JSON.parse(JSON.stringify(workflow)), 0);
+  }
 
+  private static sanitizeWorkflowRawInPlace(sanitized: any, depth: number): any {
     this.sanitizeGraph(sanitized);
 
     // Remove other potentially sensitive data
@@ -759,14 +1041,18 @@ export class WorkflowSanitizer {
     // workflow versions get the full workflow pass.
     const isWorkflowLike = (value: unknown) =>
       !!value && typeof value === 'object' && Array.isArray((value as any).nodes);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): bound nesting depth.
+    const nested = (value: any) => depth < this.MAX_NESTED_WORKFLOW_DEPTH
+      ? this.sanitizeWorkflowRawInPlace(value, depth + 1)
+      : '[REDACTED_NESTED_WORKFLOW]';
     const { nodes, connections, ...rest } = sanitized;
     const others: any = {};
     for (const [key, value] of Object.entries(rest)) {
       if (isWorkflowLike(value)) {
-        sanitized[key] = this.sanitizeWorkflowRaw(value);
+        sanitized[key] = nested(value);
       } else if (Array.isArray(value) && value.some(isWorkflowLike)) {
         sanitized[key] = value.map((item) =>
-          isWorkflowLike(item) ? this.sanitizeWorkflowRaw(item) : this.sanitizeTelemetryObject(item)
+          isWorkflowLike(item) ? nested(item) : this.sanitizeTelemetryObject(item)
         );
       } else {
         others[key] = value;

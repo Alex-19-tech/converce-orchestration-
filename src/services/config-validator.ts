@@ -816,8 +816,8 @@ export class ConfigValidator {
     }
     
     // Check for unterminated strings
-    const stringMatches = code.match(/(["'`])(?:(?=(\\?))\2.)*?\1/g) || [];
-    const quotesInStrings = stringMatches.join('').match(/["'`]/g)?.length || 0;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of a backtracking regex
+    const quotesInStrings = this.countQuotesInStringLiterals(code);
     const totalQuotes = (code.match(/["'`]/g) || []).length;
     if ((totalQuotes - quotesInStrings) % 2 !== 0) {
       warnings.push({
@@ -882,8 +882,8 @@ export class ConfigValidator {
     }
     
     // Check for colons after control structures
-    const controlStructures = /^\s*(if|elif|else|for|while|def|class|try|except|finally|with)\s+.*[^:]\s*$/gm;
-    if (controlStructures.test(code)) {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of a backtracking regex
+    if (this.hasControlStructureWithoutColon(code)) {
       warnings.push({
         type: 'inefficient',
         message: 'Missing colon after control structure',
@@ -926,7 +926,8 @@ export class ConfigValidator {
       }
       
       // Check for return without array
-      if (/return\s+{[^}]+}\s*;/.test(code) && !code.includes('[') && !code.includes(']')) {
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of a backtracking regex
+      if (this.hasReturnOfPlainObject(code) && !code.includes('[') && !code.includes(']')) {
         warnings.push({
           type: 'invalid_value',
           message: 'Return value must be an array',
@@ -1060,6 +1061,146 @@ export class ConfigValidator {
           suggestion: 'Consider adding try/catch (JavaScript) or try/except (Python) for robust error handling'
         });
       }
+    }
+  }
+
+  private static isLineTerminator(ch: string): boolean {
+    return ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029';
+  }
+
+  private static readonly WHITESPACE = /\s/;
+
+  private static isWhitespace(ch: string): boolean {
+    return this.WHITESPACE.test(ch);
+  }
+
+  /**
+   * Count the quote characters that sit inside single-line string literals.
+   * A literal opens at any quote, skips backslash escapes and closes at the
+   * next unescaped quote of the same kind on the same line. A quote with no
+   * closing partner is skipped and scanning resumes at the next character.
+   */
+  private static countQuotesInStringLiterals(code: string): number {
+    const isQuote = (ch: string) => ch === '"' || ch === "'" || ch === '`';
+    let count = 0;
+    for (const line of code.split(/[\n\r\u2028\u2029]/)) {
+      // Positions of unescaped quotes, per quote kind, in ascending order
+      const closers: Record<string, number[]> = { '"': [], "'": [], '`': [] };
+      let backslashes = 0;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '\\') {
+          backslashes++;
+          continue;
+        }
+        if (isQuote(ch) && backslashes % 2 === 0) closers[ch].push(i);
+        backslashes = 0;
+      }
+
+      const next: Record<string, number> = { '"': 0, "'": 0, '`': 0 };
+      let k = 0;
+      while (k < line.length) {
+        const quote = line[k];
+        if (!isQuote(quote)) {
+          k++;
+          continue;
+        }
+        const list = closers[quote];
+        while (next[quote] < list.length && list[next[quote]] <= k) next[quote]++;
+        if (next[quote] === list.length) {
+          k++;
+          continue;
+        }
+        const end = list[next[quote]];
+        for (let i = k; i <= end; i++) {
+          if (isQuote(line[i])) count++;
+        }
+        k = end + 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Detect a Python control-structure line that the colon check flags: a line
+   * starting with a control keyword and whitespace whose statement does not end
+   * in ':' (trailing whitespace and blank continuation lines count as not ending
+   * in ':').
+   */
+  private static hasControlStructureWithoutColon(code: string): boolean {
+    const keywords = ['if', 'elif', 'else', 'for', 'while', 'def', 'class', 'try', 'except', 'finally', 'with'];
+    const n = code.length;
+    let lineStart = 0;
+    while (lineStart <= n) {
+      // First non-whitespace character of this line
+      let firstCode = lineStart;
+      while (firstCode < n && !this.isLineTerminator(code[firstCode]) && this.isWhitespace(code[firstCode])) firstCode++;
+      let lineEnd = firstCode;
+      while (lineEnd < n && !this.isLineTerminator(code[lineEnd])) lineEnd++;
+
+      if (firstCode < lineEnd) {
+        const keyword = keywords.find(kw => code.startsWith(kw, firstCode));
+        const keywordEnd = keyword ? firstCode + keyword.length : -1;
+        if (keyword && keywordEnd < n && this.isWhitespace(code[keywordEnd])) {
+          // nextCode: first non-whitespace at or after keywordEnd; any line terminator
+          // between keywordEnd + 2 and nextCode ends the statement on a whitespace character.
+          let nextCode = keywordEnd;
+          let terminatorAfterStart = false;
+          while (nextCode < n && this.isWhitespace(code[nextCode])) {
+            if (nextCode >= keywordEnd + 2 && this.isLineTerminator(code[nextCode])) terminatorAfterStart = true;
+            nextCode++;
+          }
+          if (nextCode === n) {
+            if (keywordEnd + 1 < n) return true;
+          } else {
+            if (terminatorAfterStart) return true;
+            // statementEnd: end of the line holding nextCode; lastCode: its last
+            // non-whitespace character
+            let statementEnd = nextCode;
+            let lastCode = nextCode;
+            while (statementEnd < n && !this.isLineTerminator(code[statementEnd])) {
+              if (!this.isWhitespace(code[statementEnd])) lastCode = statementEnd;
+              statementEnd++;
+            }
+            if (code[lastCode] !== ':' || lastCode < statementEnd - 1) return true;
+            // The terminator itself ends the statement when only whitespace
+            // follows it up to another terminator or the end of the code.
+            if (statementEnd < n) {
+              let after = statementEnd + 1;
+              while (after < n && this.isWhitespace(code[after]) && !this.isLineTerminator(code[after])) after++;
+              if (after === n || this.isLineTerminator(code[after])) return true;
+            }
+          }
+        }
+      }
+      lineStart = lineEnd + 1;
+    }
+    return false;
+  }
+
+  /**
+   * Detect `return` + whitespace + `{`, at least one character other than `}`,
+   * then `}`, optional whitespace and `;`.
+   */
+  private static hasReturnOfPlainObject(code: string): boolean {
+    // First '}' after the current '{'
+    let close = -2;
+    let checkedClose = -1;
+    let from = 0;
+    while (true) {
+      const start = code.indexOf('return', from);
+      if (start === -1) return false;
+      from = start + 1;
+      let brace = start + 6;
+      while (brace < code.length && this.isWhitespace(code[brace])) brace++;
+      if (brace === start + 6 || code[brace] !== '{') continue;
+      if (close === -2 || (close !== -1 && close <= brace)) close = code.indexOf('}', brace + 1);
+      if (close === -1) return false;
+      if (close < brace + 2 || close === checkedClose) continue;
+      checkedClose = close;
+      let afterClose = close + 1;
+      while (afterClose < code.length && this.isWhitespace(code[afterClose])) afterClose++;
+      if (code[afterClose] === ';') return true;
     }
   }
 }

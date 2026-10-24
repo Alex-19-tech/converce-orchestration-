@@ -71,6 +71,63 @@ export interface N8nApiClientConfig {
   cfClientSecret?: string;
 }
 
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound the size of buffered n8n responses.
+const DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
+let warnedMaxResponseSize: string | undefined;
+
+/**
+ * Largest response (after decompression) or request body accepted from or sent to n8n, in bytes.
+ * Defaults to 50 MiB; `N8N_MCP_MAX_RESPONSE_SIZE` overrides it.
+ */
+export function getMaxResponseBytes(): number {
+  const raw = process.env.N8N_MCP_MAX_RESPONSE_SIZE;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_MAX_RESPONSE_BYTES;
+  const configured = Number(raw);
+  if (Number.isSafeInteger(configured) && configured > 0) return configured;
+  if (raw !== warnedMaxResponseSize) {
+    warnedMaxResponseSize = raw;
+    logger.warn(`Ignoring N8N_MCP_MAX_RESPONSE_SIZE="${raw.slice(0, 40)}": expected a positive whole number of bytes; using ${DEFAULT_MAX_RESPONSE_BYTES}`);
+  }
+  return DEFAULT_MAX_RESPONSE_BYTES;
+}
+
+/** axios options that apply {@link getMaxResponseBytes} to a request. */
+export function responseSizeLimits(): { maxContentLength: number; maxBodyLength: number } {
+  const limit = getMaxResponseBytes();
+  return { maxContentLength: limit, maxBodyLength: limit };
+}
+
+/** Closing sentence of every size-limit error message. */
+export const SIZE_LIMIT_HINT = 'Set N8N_MCP_MAX_RESPONSE_SIZE (bytes) to change the limit.';
+
+/** A byte limit in MB, rounded to one decimal place, for error messages. */
+export function sizeLimitMb(maxBytes: number): number {
+  return Math.round((maxBytes / (1024 * 1024)) * 10) / 10;
+}
+
+/**
+ * A readable message when `error` is axios refusing a response or request body over the size
+ * limit, otherwise null.
+ */
+export function describeSizeLimitError(error: unknown): string | null {
+  const candidate = error as { isAxiosError?: unknown; message?: unknown } | null;
+  const message = candidate?.message;
+  if (candidate?.isAxiosError !== true || typeof message !== 'string') return null;
+  const limitMb = sizeLimitMb(getMaxResponseBytes());
+  if (message.startsWith('maxContentLength size of')) {
+    return `The n8n response exceeded the ${limitMb} MB size limit and was discarded. ${SIZE_LIMIT_HINT}`;
+  }
+  if (message.startsWith('Request body larger than maxBodyLength')) {
+    return `The request body exceeded the ${limitMb} MB size limit and was not sent. ${SIZE_LIMIT_HINT}`;
+  }
+  return null;
+}
+
+function sizeLimitError(error: unknown): N8nApiError | null {
+  const message = describeSizeLimitError(error);
+  return message ? new N8nApiError(message, undefined, 'RESPONSE_TOO_LARGE') : null;
+}
+
 /**
  * Warnings for the two capability limits. Shared constants because they are emitted from two
  * places each — the write that discovers the limit, and every later write that already knows it.
@@ -229,6 +286,8 @@ export class N8nApiClient {
       // SECURITY (GHSA-cmrh-wvq6-wm9r): no redirect-following on the
       // authenticated client; pinned agent neutralizes cross-host hops anyway.
       maxRedirects: 0,
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): bound response and request size.
+      ...responseSizeLimits(),
     });
 
     // Request interceptor for logging + transport pinning
@@ -260,6 +319,12 @@ export class N8nApiClient {
         return response;
       },
       async (error: unknown) => {
+        const tooLarge = sizeLimitError(error);
+        if (tooLarge) {
+          logN8nError(tooLarge, 'n8n API Response');
+          return Promise.reject(tooLarge);
+        }
+
         // #978/#989/#990: retry connection-level failures (no response at
         // all) before mapping to N8nApiError. Re-issuing goes back through
         // this same interceptor pipeline, so a further failure is retried
@@ -542,6 +607,8 @@ export class N8nApiClient {
         maxRedirects: 0,
         httpAgent: agents.httpAgent,
         httpsAgent: agents.httpsAgent,
+        // SECURITY (GHSA-xvxq-x6hr-xc2c): bound response size.
+        ...responseSizeLimits(),
       });
 
       // Also fetch version info (will be cached)
@@ -1308,6 +1375,8 @@ export class N8nApiClient {
         maxRedirects: 0,
         httpAgent: pinned?.httpAgent,
         httpsAgent: pinned?.httpsAgent,
+        // SECURITY (GHSA-xvxq-x6hr-xc2c): bound response and request size.
+        ...responseSizeLimits(),
       });
 
       const response = await webhookClient.request(config);
@@ -1319,7 +1388,7 @@ export class N8nApiClient {
         headers: response.headers,
       };
     } catch (error) {
-      throw handleN8nApiError(error);
+      throw sizeLimitError(error) ?? handleN8nApiError(error);
     }
   }
 

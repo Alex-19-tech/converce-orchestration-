@@ -1663,4 +1663,190 @@ describe('WorkflowSanitizer', () => {
       expect(params.dollar).toBe('Bearer [REDACTED]');
     });
   });
+
+  describe('name/value parameters', () => {
+    const httpNode = (parameters: any) => ({
+      nodes: [{ id: '1', name: 'HTTP', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters }],
+      connections: {},
+    });
+    const pairs = [
+      ['key', 'DuMmY0x7Kq2Lw9Pz'],
+      ['sig', 'DuMmY1x7Kq2Lw9Pz'],
+      ['signature', 'q8Zr+2bX/9LmPq4Tz7Wy+Kp1Nc6Vd3Hs/Ej5Fa0Gu8w='],
+      ['X-Amz-Signature', 'DuMmY3x7Kq2Lw9Pz'],
+      ['code', 'DuMmY4x7Kq2Lw9Pz'],
+      ['Ocp-Apim-Subscription-Key', 'DuMmY5x7Kq2Lw9Pz'],
+      ['x-functions-key', 'DuMmY6x7Kq2Lw9Pz'],
+    ];
+
+    it('redacts values of query and header parameters whose name holds a secret', () => {
+      const parameters = {
+        queryParameters: { parameters: pairs.map(([name, value]) => ({ name, value })) },
+        headerParameters: { parameters: pairs.map(([name, value]) => ({ name, value })) },
+      };
+      for (const out of [
+        WorkflowSanitizer.sanitizeWorkflow(httpNode(parameters)).nodes[0].parameters,
+        WorkflowSanitizer.sanitizeWorkflowRaw(httpNode(parameters)).nodes[0].parameters,
+      ]) {
+        const json = JSON.stringify(out);
+        for (const [, value] of pairs) expect(json).not.toContain(value);
+        expect(out.queryParameters.parameters.map((p: any) => p.name)).toEqual(pairs.map(([name]) => name));
+      }
+    });
+
+    it('keeps values of ordinary parameter names', () => {
+      const out = WorkflowSanitizer.sanitizeWorkflow(httpNode({
+        headerParameters: { parameters: [{ name: 'Content-Type', value: 'application/json' }] },
+        queryParameters: { parameters: [{ name: 'countryCode', value: 'PL' }, { name: 'keyLength', value: 'short' }] },
+      })).nodes[0].parameters;
+      expect(out.headerParameters.parameters[0].value).toBe('application/json');
+      expect(out.queryParameters.parameters[0].value).toBe('PL');
+      expect(out.queryParameters.parameters[1].value).toBe('short');
+    });
+  });
+
+  describe('serialized key/value text', () => {
+    const params = (parameters: any) => WorkflowSanitizer.sanitizeWorkflow({
+      nodes: [{ id: '1', name: 'HTTP', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters }],
+      connections: {},
+    }).nodes[0].parameters;
+
+    it('redacts secret-named keys inside JSON header and body strings', () => {
+      const out = params({
+        jsonHeaders: '{\n  "X-API-Key": "hdrVDUMMY9q8w7e6r5t4",\n  "Authorization": "tokVDUMMYa1b2c3",\n  "Content-Type": "application/json"\n}',
+        jsonBody: '{"user": "svc", "password": "Pw0rdVDummy!x", "apiKey": "akVDUMMY12345abcde", "maxTokens": 500}',
+        expressionBody: '={ "token": "tkVDUMMY0099", "name": "{{ $json.name }}" }',
+      });
+      for (const value of ['hdrVDUMMY9q8w7e6r5t4', 'tokVDUMMYa1b2c3', 'Pw0rdVDummy!x', 'akVDUMMY12345abcde', 'tkVDUMMY0099']) {
+        expect(JSON.stringify(out)).not.toContain(value);
+      }
+      expect(JSON.parse(out.jsonHeaders)).toEqual({ 'X-API-Key': '[REDACTED]', Authorization: '[REDACTED]', 'Content-Type': 'application/json' });
+      expect(JSON.parse(out.jsonBody)).toEqual({ user: 'svc', password: '[REDACTED]', apiKey: '[REDACTED]', maxTokens: 500 });
+      expect(out.expressionBody.startsWith('=')).toBe(true);
+      expect(JSON.parse(out.expressionBody.slice(1))).toEqual({ token: '[REDACTED]', name: '{{ $json.name }}' });
+    });
+
+    it('applies name/value rules and nested JSON strings inside JSON text', () => {
+      const out = params({
+        jsonHeaders: '[{"name":"X-API-Key","value":"shortVDUMMY1"},{"name":"Accept","value":"text/plain"}]',
+        jsonBody: JSON.stringify({ payload: JSON.stringify({ password: 'shortVDUMMY2', mode: 'fast' }) }),
+      });
+      expect(JSON.parse(out.jsonHeaders)).toEqual([
+        { name: 'X-API-Key', value: '[REDACTED]' },
+        { name: 'Accept', value: 'text/plain' },
+      ]);
+      expect(JSON.parse(JSON.parse(out.jsonBody).payload)).toEqual({ password: '[REDACTED]', mode: 'fast' });
+    });
+
+    it('redacts JSON nested beyond the inspection depth', () => {
+      let value = JSON.stringify({ name: 'X-API-Key', value: 'shortVDUMMY3' });
+      for (let i = 0; i < 4; i++) value = JSON.stringify({ data: value });
+      const out = params({ jsonBody: value });
+      expect(JSON.stringify(out)).not.toContain('shortVDUMMY3');
+      expect(JSON.stringify(out)).toContain('[REDACTED_NESTED_JSON]');
+    });
+
+    it('keeps the output size close to the input size for deeply bracketed JSON', () => {
+      const text = '[\n          ' + '['.repeat(1000) + '{"password":"short"}' + ']'.repeat(1000) + ']';
+      const out = params({ jsonBody: text });
+      expect(out.jsonBody.length).toBeLessThanOrEqual(text.length);
+      expect(out.jsonBody).not.toContain('short"');
+    });
+
+    it('keeps JSON text without secrets as written', () => {
+      const text = '{ "a": 1,  "b": "x", "list": [1, 2] }';
+      expect(params({ jsonBody: text }).jsonBody).toBe(text);
+    });
+
+    it('redacts secret-named assignments in code and keeps the auth scheme', () => {
+      const out = params({
+        jsCode: [
+          "const apiKey = 'akVDUMMYcode77';",
+          'const headers = { Authorization: "Bearer bVDUMMYcode88" };',
+          "if ($json.password === 'not-a-secret') return [];",
+          "const model = 'gpt-4o-mini';",
+        ].join('\n'),
+      });
+      expect(out.jsCode).toContain("const apiKey = '[REDACTED]';");
+      expect(out.jsCode).toContain('Authorization: "Bearer [REDACTED]"');
+      expect(out.jsCode).toContain("$json.password === 'not-a-secret'");
+      expect(out.jsCode).toContain("const model = 'gpt-4o-mini';");
+    });
+
+    it('handles long serialized text', () => {
+      const inputs = ['"a":'.repeat(25_000), "'".repeat(99_000), '"password": "'.repeat(7_000), ' '.repeat(99_000) + ':"x"'];
+      const start = performance.now();
+      for (const input of inputs) WorkflowSanitizer.sanitizeTelemetryObject({ text: input });
+      expect(performance.now() - start).toBeLessThan(2000);
+    });
+  });
+
+  describe('input size and nesting bounds', () => {
+    it('handles long base64url text', () => {
+      const value = '-eyJ'.repeat(24_999);
+      const start = performance.now();
+      const out = WorkflowSanitizer.sanitizeTelemetryObject<any>({ a: value, b: value });
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(out.a).toBe(value);
+    });
+
+    it('handles many URL schemes in one value', () => {
+      const value = 'http://'.repeat(14_000);
+      const input = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`v${i}`, value]));
+      const start = performance.now();
+      const out = WorkflowSanitizer.sanitizeTelemetryObject<any>(input);
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(out.v0).toBe(value);
+    });
+
+    it('still redacts webhook URLs, JWTs and emails', () => {
+      const jwt = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiIxMjM0NTY3ODkwIn0', 'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'].join('.');
+      const out = WorkflowSanitizer.sanitizeTelemetryObject<string>(
+        `see https://example.com/a/webhook-test/abc and http://x.test/path, token ${jwt}-- end`
+      );
+      expect(out).toBe('see [REDACTED_WEBHOOK] and http://x.test/path, token [REDACTED_JWT]-- end');
+      expect(WorkflowSanitizer.sanitizeTelemetryObject(`contact ${'j'.repeat(70)}@example.com`)).toBe('contact [REDACTED_EMAIL]');
+      expect(WorkflowSanitizer.sanitizeTelemetryObject('mail jane.doe@example.com now')).toBe('mail [REDACTED_EMAIL] now');
+    });
+
+    it('handles long keys', () => {
+      const keys = [...'ABCD'].map((c) => c.repeat(40_000)).concat([...'1234'].map((d) => d.repeat(40_000) + 'a'));
+      const start = performance.now();
+      const out = WorkflowSanitizer.sanitizeTelemetryObject<any>(Object.fromEntries(keys.map((k) => [k, 'v'])));
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(Object.values(out)).toEqual(keys.map(() => '[REDACTED]'));
+    });
+
+    it('replaces strings above the size cap', () => {
+      expect(WorkflowSanitizer.sanitizeTelemetryObject('x'.repeat(100_001))).toBe('[REDACTED_LONG_STRING]');
+      expect(WorkflowSanitizer.sanitizeTelemetryObject('x'.repeat(100_000))).toBe('x'.repeat(100_000));
+    });
+
+    it('handles deeply nested workflow-like values and bounds the depth', () => {
+      const chain = () => {
+        let nested: any = { nodes: [] };
+        for (let i = 0; i < 3000; i++) nested = { nodes: [], k: nested };
+        return nested;
+      };
+      const workflow = { nodes: [], connections: {}, first: chain(), second: chain() };
+      const start = performance.now();
+      const out = WorkflowSanitizer.sanitizeWorkflowRaw(workflow);
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(out.first.k.k.k).toBe('[REDACTED_NESTED_WORKFLOW]');
+      expect(workflow.first.k.k.k).toHaveProperty('nodes');
+    });
+
+    it('handles many operations on one node', () => {
+      const operations = Array.from({ length: 12_000 }, (_, i) => ({
+        type: 'updateNode',
+        nodeName: 'Set',
+        updates: { disabled: false },
+        node: { name: 'Set', type: 'k' + i },
+      }));
+      const start = performance.now();
+      const out = WorkflowSanitizer.sanitizeOperations<any[]>(operations);
+      expect(performance.now() - start).toBeLessThan(2000);
+      expect(out).toHaveLength(12_000);
+    });
+  });
 });

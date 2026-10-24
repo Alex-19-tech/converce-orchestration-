@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { startFakeOfficialMcp, FakeOfficialMcp } from '../../helpers/fake-official-mcp-server';
-import { N8nOfficialMcpClient, probeOfficialMcp, mapOfficialTransportError, OFFICIAL_MCP_FAILURE_TTL_MS } from '@/services/n8n-official-mcp-client';
+import { N8nOfficialMcpClient, probeOfficialMcp, mapOfficialTransportError, OFFICIAL_MCP_FAILURE_TTL_MS, OfficialMcpError, withResponseSizeLimit } from '@/services/n8n-official-mcp-client';
 import { SSRFProtection } from '@/utils/ssrf-protection';
 
 let savedMode: string | undefined;
@@ -465,5 +465,59 @@ describe('N8nOfficialMcpClient', () => {
     expect(caps).toMatchObject({ reachable: true, toolCount: 1, agentTools: true });
     fake.setRaw({ status: 401, body: '{}', contentType: 'application/json' });
     expect(await probeOfficialMcp({ endpoint: fake.url, token: 'tok' })).toMatchObject({ reachable: false, error: 'OFFICIAL_MCP_AUTH_FAILED' });
+  });
+});
+
+describe('official MCP response size limit', () => {
+  const MiB = 1024 * 1024;
+  let fake: FakeOfficialMcp | undefined;
+  let savedLimit: string | undefined;
+  beforeAll(() => { savedLimit = process.env.N8N_MCP_MAX_RESPONSE_SIZE; process.env.N8N_MCP_MAX_RESPONSE_SIZE = String(MiB); });
+  afterAll(() => { if (savedLimit === undefined) delete process.env.N8N_MCP_MAX_RESPONSE_SIZE; else process.env.N8N_MCP_MAX_RESPONSE_SIZE = savedLimit; });
+  afterEach(async () => { await fake?.close(); fake = undefined; });
+
+  it('rejects a tool result over the limit with a clear error', async () => {
+    fake = await startFakeOfficialMcp({ tools: [{ name: 'big', handler: () => 'a'.repeat(3 * MiB) }, { name: 'small', handler: () => 'ok text' }] });
+    const client = new N8nOfficialMcpClient({ endpoint: fake.url, token: 'tok' });
+    const err = await client.callTool('big', {}).catch(e => e);
+    expect(err).toBeInstanceOf(OfficialMcpError);
+    expect(err.message).toContain('exceeded the 1 MB size limit');
+    expect((await client.callTool('small', {})).text).toBe('ok text');
+    await client.close();
+  });
+
+  function sseFetch(body: string, status = 200, contentType = 'text/event-stream'): (url: string | URL, init?: RequestInit) => Promise<Response> {
+    return async () => new Response(body, { status, headers: { 'content-type': contentType } });
+  }
+  const manySmallEvents = Array.from({ length: 3000 }, () => `data: ${'x'.repeat(1000)}\r\n\r\n`).join('');
+
+  it('limits an event stream per event, not in total', async () => {
+    const limited = withResponseSizeLimit(sseFetch(manySmallEvents), 64 * 1024);
+    expect((await (await limited('http://n8n.test/mcp')).text()).length).toBe(manySmallEvents.length);
+
+    const oneLarge = `data: ${'x'.repeat(100 * 1024)}\n\n`;
+    const limitedLarge = withResponseSizeLimit(sseFetch(oneLarge), 64 * 1024);
+    await expect((await limitedLarge('http://n8n.test/mcp')).text()).rejects.toThrow('size limit');
+  });
+
+  it('limits an unsuccessful event stream response in total', async () => {
+    const limited = withResponseSizeLimit(sseFetch(manySmallEvents, 500), 64 * 1024);
+    await expect((await limited('http://n8n.test/mcp')).text()).rejects.toThrow('size limit');
+  });
+
+  it('limits in total when the media type is not exactly text/event-stream', async () => {
+    for (const contentType of ['application/json; note="text/event-stream"', 'text/event-stream-x', 'text/event-stream, application/json']) {
+      const limited = withResponseSizeLimit(sseFetch(manySmallEvents, 200, contentType), 64 * 1024);
+      await expect((await limited('http://n8n.test/mcp')).text()).rejects.toThrow('size limit');
+    }
+    const parameterised = withResponseSizeLimit(sseFetch(manySmallEvents, 200, 'Text/Event-Stream; charset=utf-8'), 64 * 1024);
+    expect((await (await parameterised('http://n8n.test/mcp')).text()).length).toBe(manySmallEvents.length);
+  });
+
+  it('limits a JSON body in total', async () => {
+    const json = async () => new Response(JSON.stringify({ a: 'x'.repeat(100 * 1024) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    await expect((await withResponseSizeLimit(json, 64 * 1024)('http://n8n.test/mcp')).json()).rejects.toThrow('size limit');
+    const parsed = (await (await withResponseSizeLimit(json, 1024 * 1024)('http://n8n.test/mcp')).json()) as { a: string };
+    expect(parsed.a).toHaveLength(100 * 1024);
   });
 });

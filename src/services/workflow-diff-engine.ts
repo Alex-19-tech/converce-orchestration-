@@ -4,6 +4,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import * as vm from 'vm';
 import {
   WorkflowDiffOperation,
   WorkflowDiffRequest,
@@ -48,7 +49,16 @@ const PATCH_LIMITS = {
   MAX_PATCHES: 50,           // Max patches per operation
   MAX_REGEX_LENGTH: 500,     // Max regex pattern length (chars)
   MAX_FIELD_SIZE_REGEX: 512 * 1024, // Max field size for regex operations (512KB)
+  REGEX_EVAL_TIMEOUT_MS: 100, // Max time for one regex evaluation
+  REGEX_TIME_BUDGET_MS: 300, // Max total regex time per applyDiff call
+  MAX_PATCH_GROWTH: 512 * 1024, // Max total growth of patched fields per applyDiff call, beyond the replacement text sent (512KB)
 };
+
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound operations per request
+const MAX_DIFF_OPERATIONS = 1000;
+
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound connection output and input indexes
+export const MAX_CONNECTION_INDEX = 1000;
 
 // Keys that must never appear in property paths (prototype pollution prevention)
 const DANGEROUS_PATH_KEYS = RESERVED_OBJECT_KEYS;
@@ -66,32 +76,199 @@ function ownOutputSlots(connections: WorkflowConnection, nodeName: string, outpu
 }
 
 /**
- * Check if a regex pattern contains constructs known to cause catastrophic backtracking.
- * Detects nested quantifiers like (a+)+, (a*)+, (a+)*, (a|b+)+ etc.
+ * Check if a regex pattern repeats a group without bound (`*`, `+`, `{n,}`) when the group's
+ * body, at any depth, also repeats something without bound.
  */
+// SECURITY (GHSA-xvxq-x6hr-xc2c): scan group structure instead of matching flat text
 function isUnsafeRegex(pattern: string): boolean {
-  // Detect nested quantifiers: a quantifier applied to a group that itself contains a quantifier
-  // Examples: (a+)+, (a+)*, (.*)+, (\w+)*, (a|b+)+
-  // This catches the most common ReDoS patterns
-  const nestedQuantifier = /\([^)]*[+*][^)]*\)[+*{]/;
-  if (nestedQuantifier.test(pattern)) return true;
+  // One entry per open group: true once its body holds an unbounded quantifier.
+  const groups: boolean[] = [];
+  // Set right after a group closes, so a following quantifier knows what it repeats.
+  let closedGroupIsComplex = false;
+  let i = 0;
 
-  // Detect overlapping alternations with quantifiers: (a|a)+, (\w|\d)+
-  const overlappingAlternation = /\([^)]*\|[^)]*\)[+*{]/;
-  // Only flag if alternation branches share characters (heuristic: both contain \w, ., or same literal)
-  if (overlappingAlternation.test(pattern)) {
-    const match = pattern.match(/\(([^)]*)\|([^)]*)\)[+*{]/);
-    if (match) {
-      const [, left, right] = match;
-      // Flag if both branches use broad character classes
-      const broadClasses = ['.', '\\w', '\\d', '\\s', '\\S', '\\W', '\\D', '[^'];
-      const leftHasBroad = broadClasses.some(c => left.includes(c));
-      const rightHasBroad = broadClasses.some(c => right.includes(c));
-      if (leftHasBroad && rightHasBroad) return true;
+  const markEnclosingGroup = () => {
+    if (groups.length > 0) groups[groups.length - 1] = true;
+  };
+
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    const afterGroup = closedGroupIsComplex;
+    closedGroupIsComplex = false;
+
+    if (ch === '\\') {
+      i += 2;
+      continue;
     }
+
+    if (ch === '[') {
+      i++;
+      if (pattern[i] === '^') i++;
+      while (i < pattern.length && pattern[i] !== ']') {
+        i += pattern[i] === '\\' ? 2 : 1;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '(') {
+      groups.push(false);
+      i++;
+      // Skip group prefixes such as ?:, ?=, ?!, ?<=, ?<!, ?<name> so their "?" is not a quantifier
+      if (pattern[i] === '?') {
+        const prefix = /^\?(?:<[A-Za-z_$][\w$]*>|<=|<!|[:=!])/.exec(pattern.slice(i, i + 64));
+        i += prefix ? prefix[0].length : 1;
+      }
+      continue;
+    }
+
+    if (ch === ')') {
+      const complex = groups.pop() ?? false;
+      if (complex) markEnclosingGroup();
+      closedGroupIsComplex = complex;
+      i++;
+      continue;
+    }
+
+    let quantifierLength = 0;
+    let unbounded = false;
+    if (ch === '*' || ch === '+') {
+      quantifierLength = 1;
+      unbounded = true;
+    } else if (ch === '?') {
+      quantifierLength = 1;
+    } else if (ch === '{') {
+      const braces = /^\{\d+(,(\d*))?\}/.exec(pattern.slice(i, i + 32));
+      if (braces) {
+        quantifierLength = braces[0].length;
+        unbounded = braces[2] === '';
+      }
+    }
+
+    if (quantifierLength > 0) {
+      if (unbounded) {
+        if (afterGroup) return true;
+        markEnclosingGroup();
+      }
+      i += quantifierLength;
+      // Lazy modifier
+      if (pattern[i] === '?') i++;
+      continue;
+    }
+
+    i++;
   }
 
   return false;
+}
+
+const regexContext = vm.createContext(Object.create(null));
+const regexPatchScript = new vm.Script(`(function (input, pattern, replacement, replaceAll, maxLength) {
+  var re = new RegExp(pattern, 'g');
+  var len = input.length;
+  var count = 0;
+  var tooLarge = false;
+  var tokens = null;
+  var delta = 0;
+  var m;
+
+  function parseTemplate(groupCount, hasNamedGroups) {
+    var refs = [];
+    var literal = 0;
+    var i = 0;
+    while (i < replacement.length) {
+      if (replacement[i] !== '$' || i + 1 >= replacement.length) { literal++; i++; continue; }
+      var next = replacement[i + 1];
+      if (next === '$') { literal++; i += 2; continue; }
+      if (next === '&') { refs.push(0); i += 2; continue; }
+      if (next.charCodeAt(0) === 96) { refs.push(-1); i += 2; continue; }
+      if (next === "'") { refs.push(-2); i += 2; continue; }
+      if (next >= '0' && next <= '9') {
+        var one = next.charCodeAt(0) - 48;
+        var third = replacement[i + 2];
+        if (third >= '0' && third <= '9') {
+          var two = one * 10 + third.charCodeAt(0) - 48;
+          if (two >= 1 && two <= groupCount) { refs.push(two); i += 3; continue; }
+        }
+        if (one >= 1 && one <= groupCount) { refs.push(one); i += 2; continue; }
+        literal++; i++; continue;
+      }
+      if (next === '<' && hasNamedGroups) {
+        var close = replacement.indexOf('>', i + 2);
+        if (close !== -1) { refs.push(replacement.slice(i + 2, close)); i = close + 1; continue; }
+      }
+      literal++; i++;
+    }
+    return { refs: refs, literal: literal };
+  }
+
+  function substitutionLength(match) {
+    var total = tokens.literal;
+    for (var k = 0; k < tokens.refs.length; k++) {
+      var ref = tokens.refs[k];
+      var part;
+      if (ref === 0) part = match[0];
+      else if (ref === -1) { total += match.index; continue; }
+      else if (ref === -2) { total += len - match.index - match[0].length; continue; }
+      else if (typeof ref === 'number') part = match[ref];
+      else part = match.groups[ref];
+      if (part !== undefined) total += part.length;
+    }
+    return total;
+  }
+
+  while ((m = re.exec(input)) !== null) {
+    count++;
+    if (m[0].length === 0) re.lastIndex++;
+    if (count === 1) tokens = parseTemplate(m.length - 1, m.groups !== undefined);
+    if (count === 1 || replaceAll) {
+      delta += substitutionLength(m) - m[0].length;
+      if (replaceAll && len + delta > maxLength) { tooLarge = true; break; }
+    }
+  }
+  if (count > 0 && len + delta > maxLength) tooLarge = true;
+  var output = null;
+  if (!tooLarge && (count === 1 || (count > 1 && replaceAll))) {
+    output = input.replace(replaceAll ? new RegExp(pattern, 'g') : new RegExp(pattern), replacement);
+  }
+  result = { count: count, tooLarge: tooLarge, output: output };
+})(input, pattern, replacement, replaceAll, maxLength);`);
+
+/**
+ * Run one regex patch with a time limit. Returns the match count, whether the result would exceed
+ * maxLength, and, when the patch applies (one match, or replaceAll) within maxLength, the replaced string.
+ */
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound regex evaluation time
+function runRegexPatch(
+  input: string,
+  pattern: string,
+  replacement: string,
+  replaceAll: boolean,
+  timeoutMs: number,
+  maxLength: number
+): { count: number; output: string | null; tooLarge: boolean } | 'timeout' {
+  const ctx = regexContext as Record<string, unknown>;
+  Object.assign(ctx, { input, pattern, replacement, replaceAll, maxLength, result: null });
+  try {
+    regexPatchScript.runInContext(regexContext, { timeout: Math.max(1, Math.ceil(timeoutMs)) });
+    const result = ctx.result as { count: number; tooLarge: boolean; output: string | null };
+    return { count: result.count, output: result.output, tooLarge: result.tooLarge === true };
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') return 'timeout';
+    // Errors from the context come from another realm: rethrow as a local Error
+    throw new Error(String((error as { message?: unknown } | null)?.message ?? error));
+  } finally {
+    Object.assign(ctx, { input: null, pattern: null, replacement: null, result: null });
+  }
+}
+
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound connection indexes before they size arrays
+function connectionIndexError(name: string, index: unknown): string | null {
+  if (index === undefined) return null;
+  if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index > MAX_CONNECTION_INDEX) {
+    return `${name} ${String(index).slice(0, 40)} is out of range. Connection indexes must be integers between 0 and ${MAX_CONNECTION_INDEX}.`;
+  }
+  return null;
 }
 
 interface PathSegment {
@@ -426,6 +603,10 @@ export class WorkflowDiffEngine {
   private transferToProjectId: string | undefined;
   // Canvas groups authored by this diff — the caller must not let n8n silently reject them
   private authoredGroupNames = new Set<string>();
+  // Regex time left for this diff (patchNodeField)
+  private regexBudgetMs: number = PATCH_LIMITS.REGEX_TIME_BUDGET_MS;
+  // Patched-field growth left for this diff (patchNodeField)
+  private patchGrowthBudget: number = PATCH_LIMITS.MAX_PATCH_GROWTH;
 
   /**
    * Apply diff operations to a workflow
@@ -444,6 +625,18 @@ export class WorkflowDiffEngine {
       this.tagsToRemove = [];
       this.transferToProjectId = undefined;
       this.authoredGroupNames.clear();
+      this.regexBudgetMs = PATCH_LIMITS.REGEX_TIME_BUDGET_MS;
+      this.patchGrowthBudget = PATCH_LIMITS.MAX_PATCH_GROWTH;
+
+      if (Array.isArray(request.operations) && request.operations.length > MAX_DIFF_OPERATIONS) {
+        return {
+          success: false,
+          errors: [{
+            operation: -1,
+            message: `Too many operations (${request.operations.length}). Maximum is ${MAX_DIFF_OPERATIONS} per request; split the changes across requests.`
+          }]
+        };
+      }
 
       // Clone workflow to avoid modifying original
       const workflowCopy = JSON.parse(JSON.stringify(workflow));
@@ -699,6 +892,13 @@ export class WorkflowDiffEngine {
           if (error) return error;
         }
         return reservedConnectionKey(op.sourceOutput) ?? reservedConnectionKey(op.targetInput);
+      }
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): reject reserved setting keys
+      case 'updateSettings': {
+        const settings = operation.settings as any;
+        if (!settings || typeof settings !== 'object') return null;
+        const reservedKey = Object.keys(settings).find(key => isReservedObjectKey(key));
+        return reservedKey !== undefined ? `Setting "${reservedKey}" is reserved and cannot be used` : null;
       }
       case 'replaceConnections': {
         const connections = operation.connections as any;
@@ -1095,6 +1295,8 @@ export class WorkflowDiffEngine {
     // from output 0 to target T would falsely block adding output 1 → T (#738).
     // silent: true so warnings are emitted by the apply phase only (avoids duplicates).
     const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation, { silent: true });
+    const indexError = connectionIndexError('sourceIndex', sourceIndex) ?? connectionIndexError('targetIndex', operation.targetIndex);
+    if (indexError) return indexError;
     const existing = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput);
     if (existing) {
       const slot = existing[sourceIndex];
@@ -1190,6 +1392,8 @@ export class WorkflowDiffEngine {
     // Resolve smart parameters (branch, case) before validating connections.
     // silent: true so warnings are emitted by the apply phase only (avoids duplicates).
     const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation, { silent: true });
+    const indexError = connectionIndexError('sourceIndex', sourceIndex);
+    if (indexError) return indexError;
 
     // Validate that connection from source to "from" exists at the specific index
     const connections = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput);
@@ -1391,30 +1595,60 @@ export class WorkflowDiffEngine {
 
     const original = this.getNestedProperty(node, operation.fieldPath) as string;
     let current = original;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): bound patched field length
+    const replacementLength = operation.patches.reduce((sum, p) => sum + p.replace.length, 0);
+    const maxLength = original.length + replacementLength + this.patchGrowthBudget;
+    const tooLargeError = (i: number) => new Error(
+      `patchNodeField: patch index ${i} would grow "${operation.fieldPath}" beyond ${Math.round(maxLength / 1024)}KB ` +
+      `(patches in one request may add at most ${PATCH_LIMITS.MAX_PATCH_GROWTH / 1024}KB beyond their replacement text). ` +
+      `Use updateNode to set a large value directly.`
+    );
 
     for (let i = 0; i < operation.patches.length; i++) {
       const patch = operation.patches[i];
 
       if (patch.regex) {
-        const globalRegex = new RegExp(patch.find, 'g');
-        const matches = current.match(globalRegex);
+        // SECURITY (GHSA-xvxq-x6hr-xc2c): cap regex input after earlier patches
+        if (current.length > PATCH_LIMITS.MAX_FIELD_SIZE_REGEX) {
+          throw new Error(
+            `Field "${operation.fieldPath}" is too large for regex operations (${Math.round(current.length / 1024)}KB) at patch index ${i}. ` +
+            `Maximum is ${PATCH_LIMITS.MAX_FIELD_SIZE_REGEX / 1024}KB. Use literal matching (regex: false) for large fields.`
+          );
+        }
+        if (this.regexBudgetMs <= 0) {
+          throw new Error(
+            `patchNodeField: regex time limit for this request is used up (patch index ${i}). ` +
+            `Use literal matching (regex: false) or split the changes across requests.`
+          );
+        }
+        const timeoutMs = Math.min(PATCH_LIMITS.REGEX_EVAL_TIMEOUT_MS, this.regexBudgetMs);
+        const startedAt = performance.now();
+        const result = runRegexPatch(current, patch.find, patch.replace, patch.replaceAll === true, timeoutMs, maxLength);
+        this.regexBudgetMs -= performance.now() - startedAt;
 
-        if (!matches || matches.length === 0) {
+        if (result === 'timeout') {
+          throw new Error(
+            `patchNodeField: regex pattern at patch index ${i} took too long to evaluate on "${operation.fieldPath}". ` +
+            `Simplify the pattern or use literal matching (regex: false).`
+          );
+        }
+
+        if (result.count === 0) {
           throw new Error(
             `patchNodeField: regex pattern "${patch.find}" not found in "${operation.fieldPath}" (patch index ${i}). ` +
             `Use n8n_get_workflow to inspect the current value.`
           );
         }
 
-        if (matches.length > 1 && !patch.replaceAll) {
+        if (result.count > 1 && !patch.replaceAll) {
           throw new Error(
-            `patchNodeField: regex pattern "${patch.find}" matches ${matches.length} times in "${operation.fieldPath}" (patch index ${i}). ` +
+            `patchNodeField: regex pattern "${patch.find}" matches ${result.count} times in "${operation.fieldPath}" (patch index ${i}). ` +
             `Set "replaceAll": true to replace all occurrences, or refine the pattern to match exactly once.`
           );
         }
 
-        const regex = patch.replaceAll ? globalRegex : new RegExp(patch.find);
-        current = current.replace(regex, patch.replace);
+        if (result.tooLarge) throw tooLargeError(i);
+        current = result.output as string;
       } else {
         const occurrences = countOccurrences(current, patch.find);
 
@@ -1436,12 +1670,16 @@ export class WorkflowDiffEngine {
         // split/join inserts the replacement verbatim; String.replace would read
         // "$&", "$'" and friends in it as JS replacement patterns (#1012). Safe
         // for the single-occurrence case too: the checks above leave exactly one.
+        if (current.length + occurrences * (patch.replace.length - patch.find.length) > maxLength) {
+          throw tooLargeError(i);
+        }
         current = current.split(patch.find).join(patch.replace);
       }
     }
 
     assertPatchedJsSyntax('patchNodeField', operation.fieldPath, current, original);
     this.setNestedProperty(node, operation.fieldPath, current);
+    this.patchGrowthBudget -= Math.max(0, current.length - original.length - replacementLength);
 
     // Sanitize node after updates
     const sanitized = sanitizeNode(node);
@@ -1556,6 +1794,8 @@ export class WorkflowDiffEngine {
     if (!Number.isInteger(sourceIndex) || sourceIndex < 0) {
       throw new Error(`sourceIndex must be a non-negative integer, received ${JSON.stringify(sourceIndex)}`);
     }
+    const indexError = connectionIndexError('sourceIndex', sourceIndex) ?? connectionIndexError('targetIndex', targetIndex);
+    if (indexError) throw new Error(indexError);
 
     // Initialize source node connections object
     let nodeOutputs = ownOutputs(workflow.connections, sourceNode.name);
@@ -2014,6 +2254,9 @@ export class WorkflowDiffEngine {
         if (!Array.isArray(connections)) {
           return `Connections for "${sourceName}" output "${outputName}" must be an array of output arrays, received ${describeValueType(connections)}`;
         }
+        if (connections.length > MAX_CONNECTION_INDEX + 1) {
+          return `Connections for "${sourceName}" output "${outputName}" have ${connections.length} outputs. Maximum is ${MAX_CONNECTION_INDEX + 1}.`;
+        }
 
         for (const conns of connections) {
           // A caller may send back a shape it read from n8n, null branches included (#1096).
@@ -2031,6 +2274,9 @@ export class WorkflowDiffEngine {
             if (!nodeNames.has(conn.node)) {
               return `Target node not found in connections: ${conn.node}`;
             }
+
+            const indexError = connectionIndexError(`Connection index from "${sourceName}" output "${outputName}"`, conn.index);
+            if (indexError) return indexError;
           }
         }
       }

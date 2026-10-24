@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   classifyGroupError,
   checkNodeGroups,
@@ -117,6 +117,25 @@ describe('node-groups', () => {
       expect(result.errors).toBeUndefined();
       expect(result.nodeGroups).toEqual([{ id: 'g1', name: 'Inherited', nodeIds: ['a'] }]);
     });
+
+    it('handles a large authored group and lists a bounded number of missing members', () => {
+      const n = 120_000;
+      const nodeIds = [
+        ...Array.from({ length: n }, () => 'a'),
+        ...Array.from({ length: n }, (_, i) => `missing-${i}`),
+      ];
+      const started = performance.now();
+      const result = repairNodeGroups(
+        workflow([node('a', 'Set A')], [{ id: 'g1', name: 'Mine', nodeIds }]),
+        { authoredGroups: new Set(['Mine']) }
+      );
+
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors![0]).toContain('"missing-0"');
+      expect(result.errors![0]).toContain(`and ${n - 20} more`);
+      expect(result.errors![0]).not.toContain('"missing-20"');
+    });
   });
 
   describe('sanitizeGroupsForApi', () => {
@@ -209,6 +228,75 @@ describe('node-groups', () => {
       );
 
       expect(issues.map(i => i.code)).toContain('group-contains-trigger');
+    });
+
+    it('caps message size for a long group name with many missing members', () => {
+      const issues = checkNodeGroups(
+        workflow([], [
+          { id: 'g1', name: 'x'.repeat(10_000), nodeIds: Array.from({ length: 3_000 }, (_, i) => `n${i}`) },
+        ])
+      );
+
+      expect(issues).toHaveLength(1);
+      expect(issues[0].code).toBe('group-member-removed');
+      expect(issues[0].message).toContain('3000 node IDs');
+      expect(issues[0].message.length).toBeLessThan(500);
+      expect(issues[0].group.length).toBeLessThan(200);
+    });
+
+    it('keeps one issue per member for a few missing members', () => {
+      const issues = checkNodeGroups(
+        workflow([node('a', 'Set A')], [{ id: 'g1', name: 'G', nodeIds: ['a', 'm1', 'm2', 'm3'] }])
+      );
+
+      expect(issues.map(i => i.message)).toEqual([
+        'Node group "G" references node ID "m1", which is not in the workflow.',
+        'Node group "G" references node ID "m2", which is not in the workflow.',
+        'Node group "G" references node ID "m3", which is not in the workflow.',
+      ]);
+    });
+
+    it('reports a repeated member once', () => {
+      const isTrigger = vi.fn((n: WorkflowNode) => n.type === 'n8n-nodes-base.cron');
+      const issues = checkNodeGroups(
+        workflow([node('a', 'Every hour', 'n8n-nodes-base.cron')], [
+          { id: 'g1', name: 'Group', nodeIds: Array.from({ length: 1_000 }, () => 'a') },
+        ]),
+        { isTrigger }
+      );
+
+      expect(isTrigger).toHaveBeenCalledTimes(1);
+      expect(issues.map(i => i.message)).toEqual([
+        'Node group "Group" contains trigger node "Every hour"; n8n does not allow triggers inside a group.',
+        'Node "Every hour" is in both "Group" and "Group"; a node can only belong to one group.',
+      ]);
+    });
+
+    it('reports each member listed twice in its own group', () => {
+      const issues = checkNodeGroups(
+        workflow([node('a', 'Set A'), node('t', 'Set T')], [
+          { id: 'g1', name: 'Group', nodeIds: ['a', 'a', 't', 't'] },
+        ])
+      );
+
+      expect(issues.map(i => i.message)).toEqual([
+        'Node "Set A" is in both "Group" and "Group"; a node can only belong to one group.',
+        'Node "Set T" is in both "Group" and "Group"; a node can only belong to one group.',
+      ]);
+    });
+
+    it('caps the number of issues across many groups', () => {
+      const nodes = Array.from({ length: 6 }, (_, i) => node(`t${i}`, 'T'.repeat(5_000), 'n8n-nodes-base.cron'));
+      const groups = Array.from({ length: 5_000 }, (_, i) => ({
+        id: `g${i}`,
+        name: `Group ${i}`,
+        nodeIds: nodes.map(n => n.id),
+      }));
+      const issues = checkNodeGroups(workflow(nodes, groups), { isTrigger: () => true });
+
+      expect(issues.length).toBeLessThanOrEqual(51);
+      expect(issues[issues.length - 1].code).toBe('group-issues-truncated');
+      expect(JSON.stringify(issues).length).toBeLessThan(50_000);
     });
 
     it('reports nothing without a trigger resolver', () => {
@@ -334,6 +422,23 @@ describe('node-groups', () => {
 
       expect(classification.kind).toBe('semantic');
       expect(classification.groupName).toBe('Transform records');
+    });
+
+    it('handles a long unterminated group message', () => {
+      const message = 'group "('.repeat(8_000);
+      const started = performance.now();
+      const classification = classifyGroupError({ statusCode: 400, message, details: { message } });
+
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(classification.kind).toBe('semantic');
+      expect(classification.groupId).toBeUndefined();
+    });
+
+    it('still extracts the name and id when the quoted name contains a parenthesis', () => {
+      const error = new N8nApiError('Node group "A (b" (g7) must form a single connected subgraph.', 400);
+      const classification = classifyGroupError(error);
+
+      expect(classification).toMatchObject({ kind: 'semantic', groupName: 'A (b', groupId: 'g7' });
     });
 
     it('ignores errors unrelated to groups', () => {

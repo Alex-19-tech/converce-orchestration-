@@ -218,6 +218,10 @@ export class WorkflowVersioningService {
 
     if (versionId) {
       versionToRestore = this.nodeRepository.getWorkflowVersion(versionId, this.instanceId);
+      // SECURITY (GHSA-74hp-7jv7-vx4j): only restore a version of the requested workflow
+      if (versionToRestore && versionToRestore.workflowId !== workflowId) {
+        versionToRestore = null;
+      }
     } else {
       // Get latest backup
       versionToRestore = this.nodeRepository.getLatestWorkflowVersion(workflowId, this.instanceId);

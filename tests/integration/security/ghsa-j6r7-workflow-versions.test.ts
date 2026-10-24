@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TestDatabase, createTestDatabaseAdapter } from '../database/test-utils';
 import { NodeRepository } from '../../../src/database/node-repository';
 import { WorkflowVersioningService } from '../../../src/services/workflow-versioning-service';
 import { handleWorkflowVersions } from '../../../src/mcp/handlers-n8n-manager';
+import { N8nApiClient } from '../../../src/services/n8n-api-client';
 import { getInstanceScopeId, type InstanceContext } from '../../../src/types/instance-context';
 
 /**
@@ -24,12 +25,15 @@ describe('GHSA-j6r7-6fhx-77wx: n8n_workflow_versions cross-tenant isolation', ()
   let repository: NodeRepository;
 
   beforeEach(async () => {
+    // Both tenants' n8n instances accept their keys.
+    vi.spyOn(N8nApiClient.prototype, 'listWorkflows').mockResolvedValue({ data: [], nextCursor: null });
     testDb = new TestDatabase({ mode: 'memory' });
     const db = await testDb.initialize();
     repository = new NodeRepository(createTestDatabaseAdapter(db));
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await testDb.cleanup();
   });
 

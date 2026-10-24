@@ -9,12 +9,9 @@ import { checkJmespathQuery, findJmespathCalls } from '../utils/jmespath-checks'
 import { ValidationError, ValidationWarning } from './config-validator';
 
 /**
- * Upper bound on how much JS code we are willing to pattern-match against
- * in a single validation pass. Several regexes below (detected by CodeQL
- * `js/polynomial-redos`) are polynomial on crafted inputs with many
- * unbalanced braces/parentheses. A hard length cap bounds the worst-case
- * work to `O(MAX_CODE_LENGTH ^ k)`, which is a constant, and keeps
- * validation predictable for genuinely large (but legitimate) Code nodes.
+ * Upper bound on how much code we are willing to pattern-match against in a
+ * single validation pass. The cap keeps validation predictable for very large
+ * Code nodes.
  *
  * n8n Code nodes in practice stay well under 100 KB; 200 KB gives
  * substantial headroom without materially changing what gets validated.
@@ -27,6 +24,21 @@ const MAX_CODE_LENGTH = 200_000;
  * tiny in practice — a few hundred chars at most — so 2 KB is generous.
  */
 const MAX_SHORT_INPUT_LENGTH = 2_000;
+
+/** One whitespace character, as `\s` matches it. */
+const JS_SPACE = /\s/;
+
+/** A character that `.` in a regex does not match. */
+const PY_LINE_BREAK = /[\n\r\u2028\u2029]/;
+
+function isJsSpace(char: string | undefined): boolean {
+  return char !== undefined && JS_SPACE.test(char);
+}
+
+/** One character that `\w` matches. */
+function isWordChar(char: string | undefined): boolean {
+  return char !== undefined && /\w/.test(char);
+}
 
 /**
  * Max distance the function-head detector scans backward from a `{` to find the
@@ -1387,14 +1399,9 @@ export class NodeSpecificValidators {
     
     // Common async/await issues
     // Check for await inside a non-async function (but top-level await is fine).
-    // Length guard caps CodeQL polynomial-ReDoS exposure: the `[^}]*await`
-    // tail can backtrack on crafted input with many unbalanced braces.
-    const functionWithAwait = /function\s+\w*\s*\([^)]*\)\s*{[^}]*await/;
-    const arrowWithAwait = /\([^)]*\)\s*=>\s*{[^}]*await/;
-
     if (code.length <= MAX_CODE_LENGTH
-        && (functionWithAwait.test(code) || arrowWithAwait.test(code))
-        && !code.includes('async')) {
+        && !code.includes('async')
+        && this.hasAwaitInFunctionBody(code)) {
       warnings.push({
         type: 'best_practice',
         message: 'Using await inside a non-async function',
@@ -1416,6 +1423,75 @@ export class NodeSpecificValidators {
     }
   }
   
+  /**
+   * True when a `function name(...) {` or `(...) => {` body reaches an `await`
+   * before its first `}`. The parameter list ends at the first `)`.
+   */
+  private static hasAwaitInFunctionBody(code: string): boolean {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): index scans with cached lookups
+    // `code.indexOf(needle, from)`, reusing the previous answer when it still holds.
+    const finder = (needle: string) => {
+      let askedFrom = Infinity;
+      let found = -1;
+      return (from: number): number => {
+        if (askedFrom <= from && (found === -1 || found >= from)) return found;
+        askedFrom = from;
+        found = code.indexOf(needle, from);
+        return found;
+      };
+    };
+    // Checks the parameter list opened at a `(`: true when its body awaits,
+    // false when it does not, null once no `)` follows.
+    const paramsChecker = (arrow: boolean) => {
+      const nextParen = finder(')');
+      const nextBrace = finder('}');
+      const nextAwait = finder('await');
+      let lastClose = -1;
+      return (openParen: number): boolean | null => {
+        const close = nextParen(openParen + 1);
+        if (close === -1) return null;
+        if (close === lastClose) return false;
+        lastClose = close;
+
+        let at = close + 1;
+        while (isJsSpace(code[at])) at++;
+        if (arrow) {
+          if (code[at] !== '=' || code[at + 1] !== '>') return false;
+          at += 2;
+          while (isJsSpace(code[at])) at++;
+        }
+        if (code[at] !== '{') return false;
+        const bodyEnd = nextBrace(at + 1);
+        const awaitAt = nextAwait(at + 1);
+        return awaitAt !== -1 && (bodyEnd === -1 || awaitAt < bodyEnd);
+      };
+    };
+
+    // function <name>(...) {
+    const checkFunction = paramsChecker(false);
+    for (let at = code.indexOf('function'); at !== -1; at = code.indexOf('function', at + 1)) {
+      let i = at + 8;
+      if (!isJsSpace(code[i])) continue;
+      while (isJsSpace(code[i])) i++;
+      while (isWordChar(code[i])) i++;
+      while (isJsSpace(code[i])) i++;
+      if (code[i] !== '(') continue;
+      const awaits = checkFunction(i);
+      if (awaits === null) break;
+      if (awaits) return true;
+    }
+
+    // (...) => {
+    const checkArrow = paramsChecker(true);
+    for (let at = code.indexOf('('); at !== -1; at = code.indexOf('(', at + 1)) {
+      const awaits = checkArrow(at);
+      if (awaits === null) break;
+      if (awaits) return true;
+    }
+
+    return false;
+  }
+
   /**
    * Globals the Pyodide "Python (Beta)" runtime provided and native Python
    * (n8n 2.x, `language: "pythonNative"`) does not. Each one raises NameError.
@@ -1498,7 +1574,13 @@ export class NodeSpecificValidators {
 
   /** The plain identifier a binding target names, or null (e.g. `d["k"]`). */
   private static pythonTargetName(target: string): string | null {
-    const bare = target.trim().replace(/^[(\[\s]+|[)\]\s]+$/g, '').replace(/^\*+/, '').trim();
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): index loops instead of an end-anchored trim pattern
+    const trimmed = target.trim();
+    let from = 0;
+    let to = trimmed.length;
+    while (from < to && (trimmed[from] === '(' || trimmed[from] === '[' || JS_SPACE.test(trimmed[from]))) from++;
+    while (to > from && (trimmed[to - 1] === ')' || trimmed[to - 1] === ']' || JS_SPACE.test(trimmed[to - 1]))) to--;
+    const bare = trimmed.slice(from, to).replace(/^\*+/, '').trim();
     // `name: dict` (annotated) and `name=default` (parameter) both bind `name`.
     const name = bare.split(/[:=]/)[0].trim();
     return /^[A-Za-z_]\w*$/.test(name) ? name : null;
@@ -1613,24 +1695,59 @@ export class NodeSpecificValidators {
     return names;
   }
 
+  /**
+   * The target list of a `for <targets> in` head, read from `afterFor` (the
+   * index just past the `for` keyword): the text from the first non-blank
+   * character up to the first blank run followed by `in` and a character that
+   * `inEnds` accepts. `resume` is the index after that `in`; on no match,
+   * `stop` is where the scan ended.
+   */
+  private static pythonForTarget(
+    line: string,
+    afterFor: number,
+    inEnds: (next: string | undefined) => boolean
+  ): { target: string; resume: number } | { target: null; stop: number } {
+    let start = afterFor;
+    while (line[start] === ' ' || line[start] === '\t') start++;
+    if (start >= line.length || PY_LINE_BREAK.test(line[start])) return { target: null, stop: start };
+    for (let i = start + 1; i < line.length; i++) {
+      const char = line[i];
+      if (PY_LINE_BREAK.test(char)) return { target: null, stop: i };
+      if (char !== ' ' && char !== '\t') continue;
+      let runEnd = i;
+      while (line[runEnd] === ' ' || line[runEnd] === '\t') runEnd++;
+      if (line.startsWith('in', runEnd) && inEnds(line[runEnd + 2])) {
+        return { target: line.slice(start, i), resume: runEnd + 2 };
+      }
+      i = runEnd - 1;
+    }
+    return { target: null, stop: line.length };
+  }
+
   /** Names a statement binds in its own scope (assignment, `for`, `as`). */
   private static pythonBindingsOnLine(line: string): string[] {
     const names: string[] = [];
 
     // Assignment, including destructuring (`a, b = ...`) and annotated
     // (`name: dict = {}`). Augmented (`x += 1`) and comparisons are excluded.
-    const assignment = /^[ \t]*([^=\n]+?)(?<![=!<>+\-*/%&|^~])=(?!=)/.exec(line);
-    if (assignment) {
-      this.pythonSplitTopLevel(assignment[1]).forEach(target => {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): index scans for assignment and for targets
+    const equals = line.indexOf('=');
+    const newline = line.indexOf('\n');
+    if (equals > 0 && (newline === -1 || newline > equals)
+        && !'=!<>+-*/%&|^~'.includes(line[equals - 1]) && line[equals + 1] !== '=') {
+      this.pythonSplitTopLevel(line.slice(0, equals)).forEach(target => {
         const name = this.pythonTargetName(target);
         if (name) names.push(name);
       });
     }
 
     // `for a, b in ...:` as a statement binds for the rest of the block.
-    const forStatement = /^[ \t]*(?:async[ \t]+)?for[ \t]+(.+?)[ \t]+in[ \t]/.exec(line);
-    if (forStatement) {
-      this.pythonSplitTopLevel(forStatement[1]).forEach(target => {
+    const forHead = /^[ \t]*(?:async[ \t]+)?for[ \t]/.exec(line);
+    const forStatement = forHead
+      ? this.pythonForTarget(line, forHead[0].length - 1, next => next === ' ' || next === '\t')
+      : null;
+    if (forStatement && forStatement.target !== null) {
+      this.pythonSplitTopLevel(forStatement.target).forEach(target => {
         const name = this.pythonTargetName(target);
         if (name) names.push(name);
       });
@@ -1664,33 +1781,27 @@ export class NodeSpecificValidators {
   }
 
   /**
-   * The bracket group that encloses `index`, or null when the position is not
-   * inside one. Used to bound a comprehension or lambda to its own expression.
+   * For every position of `line`, the bracket group that encloses it: the
+   * innermost unclosed opening bracket before the position, and where that
+   * group closes (the line length when it never does). Bounds a comprehension
+   * or lambda to its own expression.
    */
-  private static pythonEnclosingGroup(line: string, index: number): { start: number; end: number } | null {
-    let closers = 0;
-    let start = -1;
-
-    for (let i = index - 1; i >= 0; i--) {
+  private static pythonBracketGroups(line: string): (index: number) => { start: number; end: number } | null {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): bracket groups indexed per line
+    const openAt = new Int32Array(line.length + 1);
+    const closeOf = new Int32Array(line.length).fill(line.length);
+    const stack: number[] = [];
+    for (let i = 0; i < line.length; i++) {
+      openAt[i] = stack.length > 0 ? stack[stack.length - 1] : -1;
       const char = line[i];
-      if (char === ')' || char === ']' || char === '}') closers++;
-      else if (char === '(' || char === '[' || char === '{') {
-        if (closers === 0) { start = i; break; }
-        closers--;
-      }
+      if (char === '(' || char === '[' || char === '{') stack.push(i);
+      else if ((char === ')' || char === ']' || char === '}') && stack.length > 0) closeOf[stack.pop()!] = i;
     }
-    if (start === -1) return null;
-
-    let depth = 0;
-    for (let i = start; i < line.length; i++) {
-      const char = line[i];
-      if (char === '(' || char === '[' || char === '{') depth++;
-      else if (char === ')' || char === ']' || char === '}') {
-        depth--;
-        if (depth === 0) return { start, end: i };
-      }
-    }
-    return { start, end: line.length };
+    openAt[line.length] = stack.length > 0 ? stack[stack.length - 1] : -1;
+    return index => {
+      const start = openAt[index];
+      return start === -1 ? null : { start, end: closeOf[start] };
+    };
   }
 
   /**
@@ -1707,20 +1818,46 @@ export class NodeSpecificValidators {
         if (name) bindings.push({ name, ...range });
       });
     };
+    let groups: ((index: number) => { start: number; end: number } | null) | null = null;
+    const enclosingGroup = (index: number) => (groups ??= this.pythonBracketGroups(line))(index);
 
-    const forTargets = /\bfor[ \t]+(.+?)[ \t]+in\b/g;
-    let match: RegExpExecArray | null;
-    while ((match = forTargets.exec(line)) !== null) {
+    let at = line.indexOf('for');
+    while (at !== -1) {
+      if (isWordChar(line[at - 1]) || (line[at + 3] !== ' ' && line[at + 3] !== '\t')) {
+        at = line.indexOf('for', at + 1);
+        continue;
+      }
+      const head = this.pythonForTarget(line, at + 3, next => !isWordChar(next));
+      if (head.target === null) {
+        // No `for` before this point can find its `in` either.
+        at = line.indexOf('for', head.stop + 1);
+        continue;
+      }
       // A comprehension binds across the whole bracket group, including the
       // output expression written before the `for`.
-      add(match[1], this.pythonEnclosingGroup(line, match.index) ?? { start: match.index, end: line.length });
+      add(head.target, enclosingGroup(at) ?? { start: at, end: line.length });
+      at = line.indexOf('for', head.resume);
     }
 
-    const lambdas = /\blambda\b([^:\n]*):/g;
-    while ((match = lambdas.exec(line)) !== null) {
+    let newline = line.indexOf('\n');
+    at = line.indexOf('lambda');
+    while (at !== -1) {
+      const after = at + 6;
+      if (isWordChar(line[at - 1]) || isWordChar(line[after])) {
+        at = line.indexOf('lambda', at + 1);
+        continue;
+      }
+      const colon = line.indexOf(':', after);
+      if (colon === -1) break;
+      if (newline !== -1 && newline < after) newline = line.indexOf('\n', after);
+      if (newline !== -1 && newline < colon) {
+        at = line.indexOf('lambda', newline + 1);
+        continue;
+      }
       // A lambda binds from its keyword onward, never before it.
-      const group = this.pythonEnclosingGroup(line, match.index);
-      add(match[1], { start: match.index, end: group ? group.end : line.length });
+      const group = enclosingGroup(at);
+      add(line.slice(after, colon), { start: at, end: group ? group.end : line.length });
+      at = line.indexOf('lambda', colon + 1);
     }
 
     return bindings;
@@ -1875,22 +2012,36 @@ export class NodeSpecificValidators {
     const { lineScope, scopes, lineLocal, referenceText } = index;
     const matcher = new RegExp(reference.source, reference.flags.includes('g') ? reference.flags : `${reference.flags}g`);
 
-    return referenceText.some((line, lineNumber) => {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): memoise scope binding per name
+    const resolved = new Int8Array(scopes.length); // 0 unknown, 1 bound, 2 unbound
+    const isBound = (from: number): boolean => {
+      const path: number[] = [];
       let bound = false;
-      for (let scope = lineScope[lineNumber]; scope !== -1; scope = scopes[scope].parent) {
+      for (let scope = from; scope !== -1; scope = scopes[scope].parent) {
+        if (resolved[scope] !== 0) { bound = resolved[scope] === 1; break; }
+        path.push(scope);
         if (scopes[scope].names.has(name)) { bound = true; break; }
       }
-      if (bound) return false;
+      for (const scope of path) resolved[scope] = bound ? 1 : 2;
+      return bound;
+    };
+
+    return referenceText.some((line, lineNumber) => {
+      if (isBound(lineScope[lineNumber])) return false;
 
       matcher.lastIndex = 0;
       let match: RegExpExecArray | null;
+      // A reference is shadowed when some local range starting at or before
+      // it reaches it; matches arrive left to right.
+      let locals: PythonLocalBinding[] | null = null;
+      let next = 0;
+      let reach = -1;
       while ((match = matcher.exec(line)) !== null) {
         if (match[0].length === 0) matcher.lastIndex++;
         const at = match.index;
-        const shadowed = lineLocal[lineNumber].some(
-          local => local.name === name && at >= local.start && at <= local.end
-        );
-        if (!shadowed) return true;
+        locals ??= lineLocal[lineNumber].filter(local => local.name === name).sort((a, b) => a.start - b.start);
+        while (next < locals.length && locals[next].start <= at) reach = Math.max(reach, locals[next++].end);
+        if (reach < at) return true;
       }
       return false;
     });
@@ -2270,7 +2421,12 @@ export class NodeSpecificValidators {
       // list, `return [...][0]` returns one element.
       const lineEnd = scan.indexOf('\n', closed);
       const rest = scan.slice(closed + 1, lineEnd === -1 ? scan.length : lineEnd);
-      if (rest.replace(/;+[ \t]*$/, '').trim() !== '') continue;
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): strip trailing separators with an index scan
+      let restEnd = rest.length;
+      while (restEnd > 0 && (rest[restEnd - 1] === ' ' || rest[restEnd - 1] === '\t')) restEnd--;
+      let separatorsStart = restEnd;
+      while (separatorsStart > 0 && rest[separatorsStart - 1] === ';') separatorsStart--;
+      if (rest.slice(0, separatorsStart).trim() !== '') continue;
       if (!innerTest) return true;
 
       const opened = match.index + match[0].length - 1;
@@ -2293,17 +2449,18 @@ export class NodeSpecificValidators {
     // which would otherwise be read as the end of the body. The header ends at
     // the first `:` outside brackets, so `def f(): return 1` ends on its own
     // line even though it does not END with a colon.
-    let header: string | null = null;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): track the open header's bracket depth
+    let headerDepth: number | null = null;
 
     for (const line of lines) {
       const indentMatch = line.match(/^[ \t]*/);
       const indent = indentMatch ? indentMatch[0].length : 0;
       const isBlank = line.trim() === '';
 
-      if (header !== null) {
-        header += `\n${line}`;
+      if (headerDepth !== null) {
         result.push('');
-        if (this.pythonHeaderColonIndex(header) !== -1) header = null;
+        if (this.pythonHeaderColonIndex(line, headerDepth) !== -1) headerDepth = null;
+        else headerDepth += this.pythonBracketDelta(line);
         continue;
       }
 
@@ -2317,7 +2474,7 @@ export class NodeSpecificValidators {
 
       if (/^[ \t]*(?:async[ \t]+)?(?:def|class)[ \t]+\w/.test(line)) {
         blockIndent = indent;
-        header = this.pythonHeaderColonIndex(line) === -1 ? line : null;
+        headerDepth = this.pythonHeaderColonIndex(line) === -1 ? this.pythonBracketDelta(line) : null;
         result.push('');
         continue;
       }
@@ -2356,6 +2513,7 @@ export class NodeSpecificValidators {
     // Tracks whether we are inside a `[...]` character class while in regex state,
     // so an unescaped `/` inside the class does not prematurely end the literal.
     let inRegexClass = false;
+    const backLinks = this.javaScriptBackLinks(code);
 
     for (let i = 0; i < code.length; i++) {
       const char = code[i];
@@ -2469,7 +2627,7 @@ export class NodeSpecificValidators {
       }
 
       if (char === '{') {
-        if (this.startsJavaScriptFunctionBody(code, i)) {
+        if (this.startsJavaScriptFunctionBody(code, i, backLinks)) {
           functionBodyDepths.push(braceDepth + 1);
         }
         braceDepth++;
@@ -2610,10 +2768,67 @@ export class NodeSpecificValidators {
     'if', 'for', 'while', 'switch', 'catch', 'with', 'await',
   ]);
 
-  private static startsJavaScriptFunctionBody(code: string, openBraceIndex: number): boolean {
-    // Arrow function: ... => {
-    const prefix = code.slice(Math.max(0, openBraceIndex - 500), openBraceIndex);
-    if (/=>\s*$/.test(prefix)) return true;
+  /**
+   * Backward lookups over the raw text, built on first use.
+   * `codeBefore(index)` is the index reached by stepping back from `index`
+   * over whitespace and block comments (from a comment close back to the
+   * nearest comment open before it), or -1 when that runs off the start.
+   * `matchingOpenParen(index)` is the `(` that the `)` at index closes, or -1.
+   */
+  private static javaScriptBackLinks(code: string): {
+    codeBefore: (index: number) => number;
+    matchingOpenParen: (index: number) => number;
+  } {
+    let before: Int32Array | null = null;
+    let parens: Int32Array | null = null;
+    return {
+      codeBefore: index => {
+        if (before === null) {
+          before = new Int32Array(code.length);
+          // Largest k <= position where `/*` ends (code[k-1] is `/`, code[k] is `*`).
+          const openers = new Int32Array(code.length);
+          let last = -1;
+          for (let k = 0; k < code.length; k++) {
+            if (k >= 1 && code[k - 1] === '/' && code[k] === '*') last = k;
+            openers[k] = last;
+          }
+          for (let k = 0; k < code.length; k++) {
+            if (JS_SPACE.test(code[k])) {
+              before[k] = k > 0 ? before[k - 1] : -1;
+            } else if (code[k] === '/' && k > 0 && code[k - 1] === '*') {
+              const opener = k >= 2 ? openers[k - 2] : -1;
+              before[k] = opener >= 2 ? before[opener - 2] : -1;
+            } else {
+              before[k] = k;
+            }
+          }
+        }
+        return index < 0 ? -1 : before[index];
+      },
+      matchingOpenParen: index => {
+        if (parens === null) {
+          parens = new Int32Array(code.length).fill(-1);
+          const stack: number[] = [];
+          for (let k = 0; k < code.length; k++) {
+            if (code[k] === '(') stack.push(k);
+            else if (code[k] === ')' && stack.length > 0) parens[k] = stack.pop()!;
+          }
+        }
+        return parens[index];
+      },
+    };
+  }
+
+  private static startsJavaScriptFunctionBody(
+    code: string,
+    openBraceIndex: number,
+    links: ReturnType<typeof NodeSpecificValidators.javaScriptBackLinks>
+  ): boolean {
+    // Arrow function: ... => { (the `=>` within 500 characters of the brace)
+    const arrowFloor = Math.max(0, openBraceIndex - 500);
+    let arrowEnd = openBraceIndex - 1;
+    while (arrowEnd >= arrowFloor && JS_SPACE.test(code[arrowEnd])) arrowEnd--;
+    if (arrowEnd - 1 >= arrowFloor && code[arrowEnd] === '>' && code[arrowEnd - 1] === '=') return true;
 
     // function declarations/expressions and method shorthand look like
     // `<keyword/name>(<params>) {`. The param list can contain nested parens
@@ -2621,33 +2836,17 @@ export class NodeSpecificValidators {
     // `function f(x = a.b()) {`), so locate the matching `(` by scanning
     // backward with a paren counter rather than a greedy `\([^)]*\)` regex
     // that stops at the first inner `)`.
-    let i = openBraceIndex - 1;
     // Skip whitespace and any block comment between the `)` and the `{`
     // (e.g. `function f() /* note */ {`).
-    while (i >= 0) {
-      if (/\s/.test(code[i])) { i--; continue; }
-      if (code[i] === '/' && i > 0 && code[i - 1] === '*') {
-        i -= 2; // step onto the char before the closing `*/`
-        while (i >= 1 && !(code[i - 1] === '/' && code[i] === '*')) i--;
-        i -= 2; // step before the opening `/*`
-        continue;
-      }
-      break;
-    }
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): precomputed backward lookups
+    const i = links.codeBefore(openBraceIndex - 1);
     if (i < 0 || code[i] !== ')') return false;
 
-    // Bound the backward walk: a real parameter list is short, so cap the scan
-    // distance. Without this, adversarial input (many unmatched `) {`) would
-    // make each brace walk to the start of the file — quadratic overall.
+    // A real parameter list is short: the matching `(` must lie within
+    // MAX_PARAM_SCAN characters of the `)`.
     const scanFloor = Math.max(0, i - MAX_PARAM_SCAN);
-    let depth = 0;
-    let j = i;
-    for (; j >= scanFloor; j--) {
-      const c = code[j];
-      if (c === ')') depth++;
-      else if (c === '(') { depth--; if (depth === 0) break; }
-    }
-    if (depth !== 0) return false; // unbalanced, or matching '(' beyond the scan window
+    const j = links.matchingOpenParen(i);
+    if (j === -1 || j < scanFloor) return false; // unbalanced, or matching '(' beyond the scan window
 
     // `head` is the text immediately before the matching `(` (the name area).
     const head = code.slice(Math.max(0, j - 60), j);
@@ -2970,17 +3169,34 @@ export class NodeSpecificValidators {
     // words are extremely common as data field names (e.g. item.json.path).
     const fsModuleUsagePatterns = [
       /require\s*\(\s*['"`](?:node:)?(?:fs|path|child_process)['"`]\s*\)/,
-      /\bimport\b[^;\n]*\bfrom\s*['"](?:node:)?(?:fs|path|child_process)['"]/,
       /\bimport\s*\(\s*['"`](?:node:)?(?:fs|path|child_process)['"`]\s*\)/,
       /(?<![.\w$])(?:fs|child_process)\s*\.\s*\w/
     ];
-    if (fsModuleUsagePatterns.some(pattern => pattern.test(code))) {
+    if (fsModuleUsagePatterns.some(pattern => pattern.test(code)) || this.importsFromFsModule(code)) {
       warnings.push({
         type: 'security',
         message: 'File system and process access not available in Code nodes',
         suggestion: 'Use other n8n nodes for file operations (e.g., Read/Write Files node)'
       });
     }
+  }
+
+  /**
+   * True when an `import` statement takes a name from fs, path or
+   * child_process: an `import` word, then a `from '<module>'` before the next
+   * `;` or newline.
+   */
+  private static importsFromFsModule(code: string): boolean {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): token scan
+    const token = /\bimport\b|[;\n]|\bfrom\s*['"](?:node:)?(?:fs|path|child_process)['"]/g;
+    let inImport = false;
+    let match: RegExpExecArray | null;
+    while ((match = token.exec(code)) !== null) {
+      if (match[0] === ';' || match[0] === '\n') inImport = false;
+      else if (match[0] === 'import') inImport = true;
+      else if (inImport) return true;
+    }
+    return false;
   }
 
   /**

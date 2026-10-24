@@ -5,6 +5,7 @@ import type { jsonSchemaValidator, JsonSchemaValidatorResult } from '@modelconte
 import { SSRFProtection, PinnedFetch } from '../utils/ssrf-protection';
 import { PROJECT_VERSION } from '../utils/version';
 import { logger } from '../utils/logger';
+import { SIZE_LIMIT_HINT, getMaxResponseBytes, sizeLimitMb } from './n8n-api-client';
 
 /**
  * The SDK client validates a tool result's `structuredContent` against the
@@ -148,6 +149,76 @@ export function mapOfficialTransportError(err: unknown): OfficialMcpError {
   return new OfficialMcpError('OFFICIAL_MCP_TRANSPORT_ERROR', 'Request to n8n MCP server failed');
 }
 
+/** Statuses whose Response must have a null body. */
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
+function responseTooLargeError(maxBytes: number): OfficialMcpError {
+  return new OfficialMcpError(
+    'OFFICIAL_MCP_TRANSPORT_ERROR',
+    `The n8n MCP server response exceeded the ${sizeLimitMb(maxBytes)} MB size limit and was discarded. ${SIZE_LIMIT_HINT}`,
+  );
+}
+
+/**
+ * Passes bytes through and errors once more than `maxBytes` arrive. With
+ * `perEvent`, the count restarts at each blank line, so a long-lived SSE
+ * stream is limited per event rather than in total.
+ */
+function byteLimitStream(maxBytes: number, perEvent: boolean): TransformStream<Uint8Array, Uint8Array> {
+  let count = 0;
+  let atLineStart = true;
+  let afterCR = false;
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      if (!perEvent) {
+        count += chunk.byteLength;
+      } else {
+        for (let i = 0; i < chunk.length; i++) {
+          const byte = chunk[i];
+          count++;
+          if (count > maxBytes) break;
+          if (byte === 0x0a && afterCR) { afterCR = false; continue; }
+          afterCR = byte === 0x0d;
+          if (byte === 0x0a || byte === 0x0d) {
+            if (atLineStart) count = 0;
+            atLineStart = true;
+          } else {
+            atLineStart = false;
+          }
+        }
+      }
+      if (count > maxBytes) {
+        controller.error(responseTooLargeError(maxBytes));
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+/** The lowercased `type/subtype` of a Content-Type header, without parameters. */
+function mediaType(header: string | null): string {
+  return (header ?? '').split(';', 1)[0].trim().toLowerCase();
+}
+
+/**
+ * Wraps a fetch so that no response body is read past `maxBytes` (after
+ * decompression). A 2xx `text/event-stream` body is limited per event; every
+ * other body is limited in total.
+ */
+export function withResponseSizeLimit(fetchFn: PinnedFetch['fetch'], maxBytes: number): PinnedFetch['fetch'] {
+  return async (url, init) => {
+    const response = await fetchFn(url, init);
+    if (!response.body || NULL_BODY_STATUSES.has(response.status)) return response;
+    const perEvent = response.ok && mediaType(response.headers.get('content-type')) === 'text/event-stream';
+    return new Response(response.body.pipeThrough(byteLimitStream(maxBytes, perEvent)), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
+}
+
 /** Serialized size of a structured payload; an unserializable value (a cycle) counts as over the cap. */
 function structuredSize(value: unknown): number {
   try {
@@ -270,7 +341,8 @@ export class N8nOfficialMcpClient {
       const pinned = SSRFProtection.createPinnedFetch(addresses);
       const transport = new StreamableHTTPClientTransport(new URL(this.endpoint), {
         requestInit: { headers: { Authorization: `Bearer ${this.token}` } },
-        fetch: pinned.fetch,
+        // SECURITY (GHSA-xvxq-x6hr-xc2c): bound response body size.
+        fetch: withResponseSizeLimit(pinned.fetch, getMaxResponseBytes()),
       });
       const client = new Client({ name: 'n8n-mcp', version: PROJECT_VERSION }, { capabilities: {}, jsonSchemaValidator: PERMISSIVE_JSON_SCHEMA_VALIDATOR });
       try {
