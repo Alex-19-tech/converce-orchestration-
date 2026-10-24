@@ -126,6 +126,16 @@ describe('Template Node Resolver', () => {
       });
     });
     
+    it('should resolve transform to native data-shaping nodes as well as code', () => {
+      const result = resolveTemplateNodeTypes(['transform']);
+
+      ['set', 'aggregate', 'summarize', 'splitOut', 'merge', 'code'].forEach(name => {
+        expect(result).toContain(`n8n-nodes-base.${name}`);
+      });
+      // splitInBatches is a loop node, not a transform
+      expect(result).not.toContain('n8n-nodes-base.splitInBatches');
+    });
+
     it('should handle trigger suffix variations', () => {
       const result = resolveTemplateNodeTypes(['slacktrigger', 'gmailtrigger']);
       

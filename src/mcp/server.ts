@@ -35,7 +35,6 @@ import { NodeRepository } from '../database/node-repository';
 import { DatabaseAdapter, createDatabaseAdapter } from '../database/database-adapter';
 import { getSharedDatabase, releaseSharedDatabase, SharedDatabaseState } from '../database/shared-database';
 import { PropertyFilter } from '../services/property-filter';
-import { TaskTemplates } from '../services/task-templates';
 import { ConfigValidator } from '../services/config-validator';
 import { EnhancedConfigValidator, ValidationMode, ValidationProfile } from '../services/enhanced-config-validator';
 import { PropertyDependencies } from '../services/property-dependencies';
@@ -53,7 +52,9 @@ import { PROJECT_VERSION } from '../utils/version';
 import { getNodeTypeAlternatives, getWorkflowNodeType } from '../utils/node-utils';
 import { NodeTypeNormalizer } from '../utils/node-type-normalizer';
 import { isDeprecatedNodeVersion, deprecatedNodeMessage, deprecatedNodeReplacementHint } from '../services/deprecated-nodes';
+import { matchSearchIntent, normalizeIntentQuery, type SearchIntent } from '../services/search-intents';
 import { parseTypeVersion } from '../utils/typeversion';
+import { SERVER_INSTRUCTIONS } from './native-first';
 import { ToolValidation, Validator, ValidationError } from '../utils/validation-schemas';
 import {
   negotiateProtocolVersion,
@@ -347,6 +348,7 @@ export class N8NDocumentationMCPServer {
           tools: {},
           resources: {},
         },
+        instructions: SERVER_INSTRUCTIONS,
       }
     );
 
@@ -798,6 +800,8 @@ export class N8NDocumentationMCPServer {
           name: 'n8n-documentation-mcp',
           version: PROJECT_VERSION,
         },
+        // This handler replaces the SDK's, so the Server option alone is not sent
+        instructions: SERVER_INSTRUCTIONS,
       };
       
       logger.info('MCP Initialize response', { response });
@@ -2257,7 +2261,7 @@ export class N8NDocumentationMCPServer {
     if (!this.db) throw new Error('Database not initialized');
 
     // Clean and prepare the query
-    const cleanedQuery = query.trim();
+    let cleanedQuery = query.trim();
     if (!cleanedQuery) {
       return { query, results: [], totalCount: 0 };
     }
@@ -2266,6 +2270,9 @@ export class N8NDocumentationMCPServer {
     if (mode === 'FUZZY') {
       return this.searchNodesFuzzy(cleanedQuery, limit, { includeOperations: options?.includeOperations });
     }
+
+    const { intent, query: intentQuery } = this.resolveSearchIntent(cleanedQuery, options?.source);
+    cleanedQuery = intentQuery;
     
     let ftsQuery: string;
     
@@ -2349,7 +2356,7 @@ export class N8NDocumentationMCPServer {
         // Then by FTS rank
         return a.rank - b.rank;
       });
-      
+
       // If FTS didn't find key primary nodes, augment with LIKE search
       const hasHttpRequest = scoredNodes.some(n => n.node_type === 'nodes-base.httpRequest');
       if (cleanedQuery.toLowerCase().includes('http') && !hasHttpRequest) {
@@ -2357,10 +2364,14 @@ export class N8NDocumentationMCPServer {
         logger.debug('FTS missed HTTP Request node, augmenting with LIKE search');
         return this.searchNodesLIKE(query, limit, options);
       }
-      
+
+      const rankedNodes: NodeRow[] = intent
+        ? this.applySearchIntent(scoredNodes, intent.nodeTypes, cleanedQuery, limit)
+        : scoredNodes;
+
       const result: any = {
         query,
-        results: scoredNodes.map(node => {
+        results: rankedNodes.map(node => {
           const nodeResult: any = {
             nodeType: node.node_type,
             workflowNodeType: getWorkflowNodeType(node.package_name, node.node_type),
@@ -2368,7 +2379,9 @@ export class N8NDocumentationMCPServer {
             description: node.description,
             category: node.category,
             package: node.package_name,
-            relevance: this.calculateRelevance(node, cleanedQuery)
+            relevance: intent?.nodeTypes.includes(node.node_type)
+              ? 'high'
+              : this.calculateRelevance(node, cleanedQuery)
           };
 
           // Add community metadata if this is a community node
@@ -2398,7 +2411,7 @@ export class N8NDocumentationMCPServer {
 
           return nodeResult;
         }),
-        totalCount: scoredNodes.length
+        totalCount: rankedNodes.length
       };
 
       // Only include mode if it's not the default
@@ -2435,7 +2448,7 @@ export class N8NDocumentationMCPServer {
       }
 
       // Track search query telemetry
-      telemetry.trackSearchQuery(query, scoredNodes.length, mode ?? 'OR');
+      telemetry.trackSearchQuery(query, rankedNodes.length, mode ?? 'OR');
 
       return result;
       
@@ -2448,7 +2461,7 @@ export class N8NDocumentationMCPServer {
         logger.warn(`FTS5 syntax error for query "${query}" in mode ${mode}`);
         
         // For problematic queries, use LIKE search with mode info
-        const likeResult = await this.searchNodesLIKE(query, limit);
+        const likeResult = await this.searchNodesLIKE(query, limit, options);
 
         // Track search query telemetry for fallback
         telemetry.trackSearchQuery(query, likeResult.results?.length ?? 0, `${mode}_LIKE_FALLBACK`);
@@ -2459,8 +2472,49 @@ export class N8NDocumentationMCPServer {
         };
       }
       
-      return this.searchNodesLIKE(query, limit);
+      return this.searchNodesLIKE(query, limit, options);
     }
+  }
+
+  /**
+   * A generic data-shaping query ("group by", "how to deduplicate?") lists the
+   * core node that performs the operation first. The whole query must match an
+   * intent phrase; it is then searched in its normalized form ("deduplicate").
+   * Searches limited to community nodes are left alone.
+   */
+  private resolveSearchIntent(query: string, source?: string): { intent?: SearchIntent; query: string } {
+    if (source === 'community' || source === 'verified') return { query };
+    const intent = matchSearchIntent(query);
+    return intent ? { intent, query: normalizeIntentQuery(query) } : { query };
+  }
+
+  /**
+   * Put an intent's core nodes at the top of search results, after any row whose
+   * display name equals the query. A target the FTS query did not return is
+   * read from the nodes table. The result is cut to `limit`.
+   */
+  private applySearchIntent(
+    rows: NodeRow[],
+    nodeTypes: readonly string[],
+    query: string,
+    limit: number
+  ): NodeRow[] {
+    const lowerQuery = query.toLowerCase();
+    const exactMatches = rows.filter(row => row.display_name.toLowerCase() === lowerQuery);
+    const placed = new Set(exactMatches.map(row => row.node_type));
+    const promoted: NodeRow[] = [];
+
+    for (const nodeType of nodeTypes) {
+      if (placed.has(nodeType)) continue;
+      const row = rows.find(r => r.node_type === nodeType)
+        ?? (this.db!.prepare('SELECT * FROM nodes WHERE node_type = ? AND is_community = 0').get(nodeType) as NodeRow | undefined);
+      if (!row) continue;
+      promoted.push(row);
+      placed.add(nodeType);
+    }
+
+    const rest = rows.filter(row => !placed.has(row.node_type));
+    return [...exactMatches, ...promoted, ...rest].slice(0, limit);
   }
   
   private async searchNodesFuzzy(
@@ -2749,7 +2803,8 @@ export class N8NDocumentationMCPServer {
     }
     
     // Split into words for normal search
-    const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+    const { intent, query: searchQuery } = this.resolveSearchIntent(query, sourceValue);
+    const words = searchQuery.toLowerCase().split(/\s+/).filter(w => w.length > 0);
     
     if (words.length === 0) {
       return { query, results: [], totalCount: 0 };
@@ -2772,7 +2827,10 @@ export class N8NDocumentationMCPServer {
     `).all(...params) as NodeRow[];
     
     // Apply relevance ranking
-    const rankedNodes = this.rankSearchResults(nodes, query, limit);
+    const relevant = this.rankSearchResults(nodes, searchQuery, limit);
+    const rankedNodes = intent
+      ? this.applySearchIntent(relevant, intent.nodeTypes, searchQuery, limit)
+      : relevant;
 
     const result: any = {
       query,
@@ -3265,12 +3323,6 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
     // Get properties (already parsed by repository)
     const allProperties = node.properties || [];
     
-    // Get essential properties
-    const essentials = PropertyFilter.getEssentials(allProperties, node.nodeType);
-    
-    // Get operations (already parsed by repository)
-    const operations = node.operations || [];
-    
     // Resolve typeVersion. The DB stores version as TEXT and may contain stale npm
     // package strings (e.g. "0.2.21") for community nodes seeded before #781 was fixed.
     // Coerce to a finite number so AI clients always receive a value usable as
@@ -3279,6 +3331,12 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
     const parsedVersion = parseTypeVersion(node.version);
     const latestVersion: number = parsedVersion ?? 1;
     const versionWasCoerced = parsedVersion === null && node.version != null;
+
+    // Essential properties as shown at the version the agent is told to use
+    const essentials = PropertyFilter.getEssentials(allProperties, node.nodeType, latestVersion);
+    
+    // Get operations (already parsed by repository)
+    const operations = node.operations || [];
     const versionNotice = isCommunityNode
       ? `⚠️ Use typeVersion: ${latestVersion} when creating this node. Community node typeVersion comes from the node descriptor (typically 1) and is independent of the npm package version.`
       : `⚠️ Use typeVersion: ${latestVersion} when creating this node`;
@@ -3974,52 +4032,7 @@ Full documentation is being prepared. For now, use get_node_essentials for confi
     
     return value;
   }
-  
-  private async listTasks(category?: string): Promise<any> {
-    if (category) {
-      const categories = TaskTemplates.getTaskCategories();
-      const tasks = categories[category];
-      
-      if (!tasks) {
-        throw new Error(
-          `Unknown category: ${category}. Available categories: ${Object.keys(categories).join(', ')}`
-        );
-      }
-      
-      return {
-        category,
-        tasks: tasks.map(task => {
-          const template = TaskTemplates.getTaskTemplate(task);
-          return {
-            task,
-            description: template?.description || '',
-            nodeType: template?.nodeType || ''
-          };
-        })
-      };
-    }
-    
-    // Return all tasks grouped by category
-    const categories = TaskTemplates.getTaskCategories();
-    const result: any = {
-      totalTasks: TaskTemplates.getAllTasks().length,
-      categories: {}
-    };
-    
-    for (const [cat, tasks] of Object.entries(categories)) {
-      result.categories[cat] = tasks.map(task => {
-        const template = TaskTemplates.getTaskTemplate(task);
-        return {
-          task,
-          description: template?.description || '',
-          nodeType: template?.nodeType || ''
-        };
-      });
-    }
-    
-    return result;
-  }
-  
+
   /**
    * The typeVersion the validators see for a single-node config: the caller's `@version` when
    * it is a finite number (or numeric string), else the node's version from the database.

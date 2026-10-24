@@ -58,13 +58,13 @@ describe('PropertyFilter', () => {
       expect(result.required[0].name).toBe('url');
       expect(result.required[0].required).toBe(true);
       
-      expect(result.common).toHaveLength(5);
+      // Curated order; names missing from the schema are skipped
       expect(result.common.map(p => p.name)).toEqual([
         'method',
         'authentication',
+        'sendHeaders',
         'sendBody',
-        'contentType',
-        'sendHeaders'
+        'contentType'
       ]);
     });
 
@@ -115,6 +115,194 @@ describe('PropertyFilter', () => {
       expect(result.common).toHaveLength(2);
       expect(result.common[0].name).toBe('field1');
       expect(result.common[1].name).toBe('field2'); // Single condition included
+    });
+  });
+
+  describe('getEssentials at a typeVersion', () => {
+    const versioned = [
+      { name: 'mode', type: 'options', options: [{ name: 'A', value: 'a' }] },
+      { name: 'legacyField', type: 'string', displayOptions: { show: { '@version': [1, 1.1] } } },
+      { name: 'newField', type: 'boolean', displayOptions: { show: { '@version': [{ _cnd: { gte: 2 } }] } } },
+    ];
+
+    it('drops properties hidden at that version and the resolved @version gates', () => {
+      const result = PropertyFilter.getEssentials(versioned, 'nodes-base.unknownNode', 2);
+      const names = [...result.required, ...result.common].map(p => p.name);
+      expect(names).toEqual(['mode', 'newField']);
+      // newField is always shown at v2, so it is listed as unconditional
+      expect(result.common.find(p => p.name === 'newField')?.showWhen).toBeUndefined();
+    });
+
+    it('keeps every version when no version is given', () => {
+      const result = PropertyFilter.getEssentials(versioned, 'nodes-base.unknownNode');
+      expect([...result.required, ...result.common].map(p => p.name)).toContain('legacyField');
+    });
+
+    it('leaves the schema and its gates alone when the version does not parse', () => {
+      for (const version of ['', 'abc', '0.2.21']) {
+        const names = (() => {
+          const result = PropertyFilter.getEssentials(versioned, 'nodes-base.unknownNode', version);
+          return [...result.required, ...result.common];
+        })();
+        expect(names.map(p => p.name), version).toContain('legacyField');
+        expect(names.find(p => p.name === 'newField')?.showWhen, version).toBeDefined();
+      }
+    });
+
+    it('accepts the stored "1,2" version format', () => {
+      const result = PropertyFilter.getEssentials(versioned, 'nodes-base.unknownNode', '1,2');
+      expect([...result.required, ...result.common].map(p => p.name)).toEqual(['mode', 'newField']);
+    });
+
+    it('skips null entries in a schema instead of throwing', () => {
+      expect(() => PropertyFilter.getEssentials([null, ...versioned] as any[], 'nodes-base.unknownNode', 2)).not.toThrow();
+    });
+  });
+
+  describe('options collections', () => {
+    const perOperation = [
+      { name: 'operation', type: 'options', options: [{ name: 'Format', value: 'formatDate' }, { name: 'Now', value: 'getCurrentDate' }] },
+      { name: 'options', type: 'collection', displayOptions: { show: { operation: ['formatDate'] } }, options: [
+        { name: 'includeInputFields', type: 'boolean', description: 'Whether to include all input fields. More text here.' },
+        { name: 'timezone', type: 'string', description: 'The timezone to use' },
+      ] },
+      { name: 'options', type: 'collection', displayOptions: { show: { operation: ['getCurrentDate'] } }, options: [
+        { name: 'includeInputFields', type: 'boolean', description: 'Whether to include all input fields' },
+        { name: 'timezone', type: 'string', description: 'The timezone to use' },
+        { name: 'format', type: 'options', options: [{ name: 'ISO', value: 'iso' }, { name: 'Comma', value: ', ' }] },
+      ] },
+    ];
+
+    it('merges per-operation options collections and notes where a child applies', () => {
+      const result = PropertyFilter.getEssentials(perOperation, 'nodes-base.unknownNode', 1);
+      const options = result.common.filter(p => p.name === 'options');
+      expect(options).toHaveLength(1);
+      const children = Object.fromEntries(options[0].options!.map(o => [o.value, o.description]));
+      expect(Object.keys(children)).toEqual(['includeInputFields', 'timezone', 'format']);
+      // In both collections: no note. First sentence only.
+      expect(children.includeInputFields).toBe('Whether to include all input fields.');
+      // Only in one: says when it applies; option values with spaces are quoted
+      expect(children.format).toBe('Values: iso|", ". Only when operation=getCurrentDate.');
+      expect(options[0].showWhen).toBeUndefined();
+    });
+
+    it('leaves @version gates out of the "Only when" note', () => {
+      const gated = perOperation.map(prop => prop.name === 'options'
+        ? { ...prop, displayOptions: { show: { ...prop.displayOptions!.show, '@version': [{ _cnd: { gte: 2 } }] } } }
+        : prop);
+      const result = PropertyFilter.getEssentials(gated, 'nodes-base.unknownNode');
+      const format = result.common.find(p => p.name === 'options')!.options!.find(o => o.value === 'format');
+      expect(format?.description).toBe('Values: iso|", ". Only when operation=getCurrentDate.');
+    });
+
+    it('says when a long settings list is cut', () => {
+      const many = Array.from({ length: 30 }, (_, i) => ({ name: `setting${i}`, type: 'boolean', description: `Setting ${i}` }));
+      const result = PropertyFilter.getEssentials([{ name: 'options', type: 'collection', options: many }], 'nodes-base.unknownNode', 1);
+      const options = result.common.find(p => p.name === 'options')!;
+      expect(options.options).toHaveLength(25);
+      expect(options.usageHint).toBe('Lists 25 of 30 settings. get_node with mode "search_properties" or detail "full" shows the rest.');
+    });
+
+    it('keeps same-named settings that apply under different conditions', () => {
+      const result = PropertyFilter.getEssentials([{ name: 'options', type: 'collection', options: [
+        { name: 'size', type: 'options', displayOptions: { show: { '/model': ['dall-e-2'] } }, options: [{ name: 'S', value: '256x256' }] },
+        { name: 'size', type: 'options', displayOptions: { show: { '/model': ['dall-e-3'] } }, options: [{ name: 'L', value: '1792x1024' }] },
+      ] }], 'nodes-base.unknownNode', 1);
+      expect(result.common[0].options).toEqual([
+        { value: 'size', label: 'size', description: 'Values: 256x256. Only when model=dall-e-2.' },
+        { value: 'size', label: 'size', description: 'Values: 1792x1024. Only when model=dall-e-3.' },
+      ]);
+    });
+
+    it('strips nested and broken-up HTML tags from the line', () => {
+      const result = PropertyFilter.getEssentials([{ name: 'options', type: 'collection', options: [
+        { name: 'tagged', type: 'boolean', description: 'See <<b>b>the docs</b> <a href="x">here</a>.' },
+      ] }], 'nodes-base.unknownNode', 1);
+      expect(result.common[0].options![0].description).toBe('See the docs here.');
+    });
+
+    it('keeps one entry per definition when merged collections disagree', () => {
+      const result = PropertyFilter.getEssentials([
+        { name: 'options', type: 'collection', displayOptions: { show: { operation: ['now'] } }, options: [
+          { name: 'timezone', type: 'string', description: 'The timezone to use' },
+          { name: 'keep', type: 'boolean', description: 'Same in both' },
+        ] },
+        { name: 'options', type: 'collection', displayOptions: { show: { operation: ['format'] } }, options: [
+          { name: 'timezone', type: 'boolean', description: 'Whether to apply the workflow timezone' },
+          { name: 'keep', type: 'boolean', description: 'Same in both, other wording' },
+        ] },
+      ], 'nodes-base.unknownNode', 1);
+      const lines = result.common.find(p => p.name === 'options')!.options!.map(o => `${o.value}: ${o.description}`);
+      expect(lines).toEqual([
+        'timezone: The timezone to use. Only when operation=now.',
+        'keep: Same in both.',
+        'timezone: Whether to apply the workflow timezone. Only when operation=format.',
+      ]);
+    });
+
+    it('folds conditions only when the rules differ in one field', () => {
+      const collection = (show: Record<string, string[]>, child: string) =>
+        ({ name: 'options', type: 'collection', displayOptions: { show }, options: [{ name: child, type: 'number' }] });
+      const result = PropertyFilter.getEssentials([
+        collection({ resource: ['chat'], operation: ['complete'] }, 'maxTokens'),
+        collection({ resource: ['text'], operation: ['complete', 'edit'] }, 'maxTokens'),
+        collection({ resource: ['image'], operation: ['create'] }, 'size'),
+        collection({ resource: ['text'], operation: ['complete'] }, 'echo'),
+        collection({ resource: ['text'], operation: ['edit'] }, 'echo'),
+      ], 'nodes-base.unknownNode', 1);
+      const lines = Object.fromEntries(result.common.find(p => p.name === 'options')!.options!.map(o => [o.value, o.description]));
+      // chat/edit is not a valid combination, so the clauses stay apart
+      expect(lines.maxTokens).toBe('Only when operation=complete & resource=chat or operation=complete|edit & resource=text.');
+      // only the operation differs: folded
+      expect(lines.echo).toBe('Only when operation=complete|edit & resource=text.');
+    });
+
+    it('writes out operator and hide conditions', () => {
+      const result = PropertyFilter.getEssentials([{ name: 'options', type: 'collection', options: [
+        { name: 'quoted', type: 'boolean', displayOptions: { show: { '/queryReplacement': [{ _cnd: { exists: true } }] } } },
+        { name: 'clash', type: 'boolean', displayOptions: { hide: { '/joinMode': ['keepMatches', 'keepNonMatches'] } } },
+        { name: 'big', type: 'number', displayOptions: { show: { limit: [{ _cnd: { gte: 10 } }, 5] } } },
+        { name: 'named', type: 'string', displayOptions: { hide: { sheetName: [''] } } },
+      ] }], 'nodes-base.unknownNode', 1);
+      const lines = result.common[0].options!.map(o => o.description);
+      expect(lines).toEqual([
+        'Only when queryReplacement is set.',
+        'Only when not joinMode=keepMatches|keepNonMatches.',
+        'Only when (limit=5 or limit>=10).',
+        'Only when not sheetName="".',
+      ]);
+    });
+
+    it('keeps abbreviations inside the first sentence', () => {
+      const result = PropertyFilter.getEssentials([{ name: 'options', type: 'collection', options: [
+        { name: 'quoted', type: 'boolean', description: 'Whether to treat values as text, e.g. "1" stays a string. Second sentence.' },
+      ] }], 'nodes-base.unknownNode', 1);
+      expect(result.common[0].options![0].description).toBe('Whether to treat values as text, e.g. "1" stays a string.');
+    });
+
+    it('does not append options for service nodes with a resource selector', () => {
+      const result = PropertyFilter.getEssentials(
+        [{ name: 'resource', type: 'options', options: [{ name: 'Contact', value: 'contact' }] }, ...perOperation],
+        'nodes-base.unknownNode',
+        1
+      );
+      expect(result.common.some(p => p.name === 'options')).toBe(false);
+    });
+
+    it('lists fixedCollection groups with their fields and allowed values on one line', () => {
+      const result = PropertyFilter.getEssentials([
+        { name: 'fieldsToSummarize', type: 'fixedCollection', options: [
+          { name: 'values', displayName: 'Values', values: [
+            { name: 'aggregation', type: 'options', options: [{ name: 'Sum', value: 'sum' }, { name: 'Count', value: 'count' }] },
+            { name: 'field', type: 'string' },
+            { name: 'field', type: 'string' },
+            { name: 'hint', type: 'notice' },
+          ] },
+        ] },
+      ], 'nodes-base.unknownNode', 1);
+      const line = result.common[0].options![0];
+      expect(line).toEqual({ value: 'values', label: 'Values', description: 'Fields: aggregation (sum|count), field.' });
+      expect(line.description).not.toContain('\n');
     });
   });
 
