@@ -192,9 +192,13 @@ function callbackResult(callback: AstNode): AstNode | undefined {
  * when the code may need to be code.
  */
 export function findNativeAlternative(jsCode: unknown, mode: unknown = 'runOnceForAllItems'): NativeAlternative | undefined {
+  // An omitted mode is n8n's default; an expression ({{ ... }}) or unknown value leaves
+  // the mode unknown, and the suggestion depends on it
+  const knownMode = mode === undefined || mode === null ? 'runOnceForAllItems' : mode;
+  if (knownMode !== 'runOnceForAllItems' && knownMode !== 'runOnceForEachItem') return undefined;
   // Advice only: an unexpected syntax tree must never break validation
   try {
-    return analyze(jsCode, mode === 'runOnceForEachItem' ? 'runOnceForEachItem' : 'runOnceForAllItems');
+    return analyze(jsCode, knownMode);
   } catch {
     return undefined;
   }
@@ -272,8 +276,14 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
       case 'VariableDeclarator':
         // Destructuring, a variable filled in later, or one that hides a global or
         // n8n name (const String = ...) needs code
-        if (node.id.type === 'Identifier' && node.init && !isReservedName(node.id.name)) inits.set(node.id.name, node.init);
-        else disqualified = true;
+        // A name declared twice (block scopes) or a variable holding $input itself
+        // (const inp = $input) would be resolved wrongly below
+        if (node.id.type === 'Identifier' && node.init && !isReservedName(node.id.name) && !inits.has(node.id.name) &&
+            !isIdentifier(node.init, '$input')) {
+          inits.set(node.id.name, node.init);
+        } else {
+          disqualified = true;
+        }
         break;
       case 'ExpressionStatement':
         // A statement is either a field assignment (checked below) or a call for its
@@ -549,7 +559,18 @@ function isDedupeCallback(callback: AstNode): boolean {
  * all still there when the node runs once.
  */
 function readsBeyondFirstItem(program: AstNode, inits: Map<string, AstNode>): boolean {
-  const aliases = new Set([...inits].filter(([, init]) => isItemsSource(init)).map(([name]) => name));
+  // Variables holding the input list, directly or through other variables
+  const aliases = new Set<string>();
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, init] of inits) {
+      if (aliases.has(name)) continue;
+      if (isItemsSource(init) || (init.type === 'Identifier' && aliases.has(init.name))) {
+        aliases.add(name);
+        changed = true;
+      }
+    }
+  }
   let reads = false;
   walk(program, (node, parent) => {
     if (reads) return;

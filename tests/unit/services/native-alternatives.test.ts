@@ -30,6 +30,11 @@ describe('findNativeAlternative', () => {
       expect(findNativeAlternative(code, 'runOnceForAllItems')).toBeUndefined();
     });
 
+    it('nothing when the mode is an expression', () => {
+      expect(findNativeAlternative(`return { json: { id: $json.id } };`, "={{ 'runOnceForEachItem' }}")).toBeUndefined();
+      expect(findNativeAlternative(`return { json: { id: $json.id } };`, undefined)).toMatchObject({ kind: 'editFields', executeOnce: true });
+    });
+
     it('Execute Once only when the code reads no input item past the first', () => {
       expect(findNativeAlternative(`return { json: { a: $input.first().json.a, b: items[0].json.b } };`)).toMatchObject({ kind: 'editFields', executeOnce: true });
       expect(findNativeAlternative(`const all = $input.all();\nreturn { json: { a: all[0].json.a } };`)).toMatchObject({ kind: 'editFields', executeOnce: true });
@@ -184,6 +189,9 @@ describe('findNativeAlternative', () => {
       ['a count of all items in one item', `return { json: { count: $input.all().length } };`],
       ['the last item read into one item', `return { json: { last: $input.last().json.id } };`],
       ['a request body built from all items', `const response = await this.helpers.httpRequest({ method: 'POST', url: 'https://example.com', body: { ids: items.map(i => i.json.id) } });\nreturn [{ json: response }];`],
+      ['a count through two aliases', `const all = $input.all();\nconst rows = all;\nreturn { json: { count: rows.length } };`],
+      ['an alias of $input', `const inp = $input;\nreturn { json: { count: inp.all().length } };`],
+      ['a name declared again in a block', `const source = $('Other').all();\n{ const source = $input.all(); }\nreturn source.filter(item => item.json.active);`],
       ['a comparator on different fields', `return items.sort((a, b) => a.json.x - b.json.y);`],
       ['several items per item, flattened', `return $input.all().map(item => [{ json: { id: item.json.id } }, { json: { id: item.json.id } }]).flat();`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],
