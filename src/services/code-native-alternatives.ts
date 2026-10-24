@@ -768,15 +768,18 @@ function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): 
   return [...uses.values()].some(count => count > 1);
 }
 
-/** Math.random(), Date.now(), DateTime.now(), new Date() or $now: a new value on each evaluation. */
-function isChangingValue(node: AstNode): boolean {
-  let changing = false;
-  walk(node, (child) => {
-    if (isIdentifier(child, '$now')) changing = true;
-    if (child.type === 'CallExpression' && ['random', 'now'].includes(propertyName(child.callee) ?? '')) changing = true;
-    if (child.type === 'NewExpression' && child.arguments.length === 0) changing = true;
+/**
+ * Math.random(), Date.now(), DateTime.now(), new Date() or $now: a new value on each
+ * evaluation. So is anything built from a variable in `changing`.
+ */
+function isChangingValue(node: AstNode, changing: Set<string>): boolean {
+  let found = false;
+  walk(node, (child, parent) => {
+    if (child.type === 'Identifier' && (child.name === '$now' || changing.has(child.name)) && !isPropertyName(child, parent)) found = true;
+    if (child.type === 'CallExpression' && ['random', 'now'].includes(propertyName(child.callee) ?? '')) found = true;
+    if (child.type === 'NewExpression' && child.arguments.length === 0) found = true;
   });
-  return changing;
+  return found;
 }
 
 /**
@@ -790,7 +793,7 @@ function sharesChangingValue(program: AstNode, inits: Map<string, AstNode>): boo
     added = false;
     for (const [name, init] of inits) {
       if (changing.has(name)) continue;
-      if ((init.type === 'Identifier' && changing.has(init.name)) || (init.type !== 'Identifier' && isChangingValue(init))) {
+      if (isChangingValue(init, changing)) {
         changing.add(name);
         added = true;
       }

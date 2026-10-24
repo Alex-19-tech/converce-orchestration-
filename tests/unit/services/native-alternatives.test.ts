@@ -193,6 +193,8 @@ describe('findNativeAlternative', () => {
       ['a request body built from all items', `const response = await this.helpers.httpRequest({ method: 'POST', url: 'https://example.com', body: { ids: items.map(i => i.json.id) } });\nreturn [{ json: response }];`],
       ['a count of $items()', `return { json: { count: $items().length } };`],
       ['a random value shared by mapped items', `const token = Math.random();\nreturn $input.all().map(item => ({ json: { id: item.json.id, token } }));`],
+      ['a token built from a random value', `const seed = Math.random();\nconst token = 'batch-' + seed;\nreturn $input.all().map(item => ({ json: { id: item.json.id, token } }));`],
+      ['$now held in a variable', `const stamp = $now;\nreturn $input.all().map(item => ({ json: { id: item.json.id, stamp } }));`],
       ['a timestamp shared through an alias', `const now = new Date().toISOString();\nconst stamp = now;\nreturn $input.all().map(item => ({ json: { id: item.json.id, stamp } }));`],
       ['a count through two aliases', `const all = $input.all();\nconst rows = all;\nreturn { json: { count: rows.length } };`],
       ['an alias of $input', `const inp = $input;\nreturn { json: { count: inp.all().length } };`],
