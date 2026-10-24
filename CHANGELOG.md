@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.99.1] - 2026-10-24
+
+### Security
+
+- Fix a remaining denial of service path in workflow validation (GHSA-xvxq-x6hr-xc2c).
+
 ## [2.99.0] - 2026-10-24
 
 ### Security
