@@ -1504,9 +1504,10 @@ export class WorkflowValidator {
     if (!alternative) return;
 
     const runOnce = alternative.executeOnce ? ' with its "Execute Once" setting on' : '';
-    const message = `Code node "${node.name}" only ${alternative.does}. The ${alternative.node} node ` +
-      `(${alternative.nodeType})${runOnce} does this without code. If this needs a Code node, start its ` +
-      `notes with "Why Code:" and the reason.`;
+    const nativeNode = `the ${alternative.node} node (${alternative.nodeType})${runOnce} does this without code.`;
+    const message = `Code node "${node.name}" only ${alternative.does}. ` +
+      (alternative.when ? `If ${alternative.when}, ${nativeNode}` : nativeNode.charAt(0).toUpperCase() + nativeNode.slice(1)) +
+      ' If this needs a Code node, start its notes with "Why Code:" and the reason.';
     if (this.isAdvisoryProfile(profile)) {
       result.warnings.push({ type: 'warning', nodeId: node.id, nodeName: node.name, message, code: 'NATIVE_ALTERNATIVE' });
     } else {

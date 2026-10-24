@@ -70,6 +70,16 @@ describe('findNativeAlternative', () => {
         .toBe('removeDuplicates');
     });
 
+    it('Sort, Summarize and Remove Duplicates name the data they need', () => {
+      expect(findNativeAlternative(`return $input.all().sort((a, b) => b.json.score - a.json.score);`))
+        .toMatchObject({ kind: 'sort', when: 'the field holds numbers' });
+      expect(findNativeAlternative(`const total = $input.all().reduce((sum, item) => sum + item.json.amount, 0);\nreturn [{ json: { total } }];`))
+        .toMatchObject({ kind: 'summarize', when: 'the field holds numbers' });
+      expect(findNativeAlternative(`return items.filter((item, index, all) => all.findIndex(other => other.json.id === item.json.id) === index);`))
+        .toMatchObject({ kind: 'removeDuplicates', when: 'the compared fields hold text or numbers' });
+      expect(findNativeAlternative(`return { json: { a: $json.a } };`)?.when).toBeUndefined();
+    });
+
     it('Summarize for a numeric total', () => {
       expect(kindOf(`const total = $input.all().reduce((sum, item) => sum + item.json.amount, 0);\nreturn [{ json: { total } }];`))
         .toBe('summarize');
@@ -153,7 +163,9 @@ describe('findNativeAlternative', () => {
       ['a dedupe whose inner item shadows the outer one', `return items.filter((item, i, all) => all.findIndex(item => item.json.id === item.json.id) === i);`],
       ['a list sorted in place next to a filter', `const ignored = $input.first().json.tags.sort();\nreturn $input.all().filter(item => item.json.active);`],
       ['a pairwise precedence comparator', `return items.sort((a, b) => Number(b.json.before.includes(a.json.id)) - Number(a.json.before.includes(b.json.id)));`],
-      ['a numeric sort (the field may hold numeric strings, which Sort compares as text)', `return $input.all().sort((a, b) => b.json.score - a.json.score);`],
+      ['a sort on item metadata', `return items.sort((a, b) => a.pairedItem.item - b.pairedItem.item);`],
+      ['a total of item metadata', `const total = items.reduce((s, item) => s + item.pairedItem.item, 0);\nreturn [{ json: { total } }];`],
+      ['text joined with reduce', `const text = items.reduce((s, item) => s + item.json.name, '');\nreturn [{ json: { text } }];`],
       ['a dedupe comparing whole json objects', `return items.filter((item, i, all) => all.findIndex(other => other.json === item.json) === i);`],
       ['a local items holding another node', `const items = $('Fetch').all();\nreturn items[0].json.rows.map(row => ({ json: row }));`],
       ['a localeCompare sort (Sort compares raw lowercased values)', `return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name, 'en'));`],
@@ -240,6 +252,17 @@ describe('WorkflowValidator native-alternative checks', () => {
       expect(warning?.message).toContain('"Execute Once"');
       expect(warning?.message).toContain('"Why Code:"');
     }
+  });
+
+  it('states the condition for a conditioned suggestion', async () => {
+    const result = await validator.validateWorkflow(workflowWith({
+      type: 'n8n-nodes-base.code',
+      parameters: { jsCode: `const total = $input.all().reduce((sum, item) => sum + item.json.amount, 0);\nreturn [{ json: { total } }];` },
+    }) as any, { profile: 'runtime' });
+    expect(result.suggestions).toContain(
+      'Code node "Step" only totals a field over the items. If the field holds numbers, the Summarize node ' +
+      '(n8n-nodes-base.summarize) does this without code. If this needs a Code node, start its notes with "Why Code:" and the reason.'
+    );
   });
 
   it('suggests under runtime and says nothing under minimal', async () => {

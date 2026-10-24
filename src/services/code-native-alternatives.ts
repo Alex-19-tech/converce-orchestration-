@@ -15,6 +15,7 @@ import { parse } from 'acorn';
 export type NativeAlternativeKind =
   | 'editFields'
   | 'filter'
+  | 'sort'
   | 'removeDuplicates'
   | 'summarize'
   | 'aggregate'
@@ -30,6 +31,11 @@ export interface NativeAlternative {
   /** What the Code node does, completing "This Code node only ..." */
   does: string;
   /**
+   * A condition on the data the native node needs to match the code, when the
+   * code doesn't show it (field types): "the field holds numbers".
+   */
+  when?: string;
+  /**
    * The node must run once rather than once per item ("Execute Once" in its
    * settings): the Code node runs once for all items and produces one result.
    */
@@ -42,8 +48,12 @@ export type CodeNodeMode = 'runOnceForAllItems' | 'runOnceForEachItem';
 const ALTERNATIVES: Record<NativeAlternativeKind, Omit<NativeAlternative, 'kind' | 'executeOnce'>> = {
   editFields: { node: 'Edit Fields (Set)', nodeType: 'n8n-nodes-base.set', does: 'builds or renames fields' },
   filter: { node: 'Filter', nodeType: 'n8n-nodes-base.filter', does: 'filters items' },
-  removeDuplicates: { node: 'Remove Duplicates', nodeType: 'n8n-nodes-base.removeDuplicates', does: 'removes duplicate items' },
-  summarize: { node: 'Summarize', nodeType: 'n8n-nodes-base.summarize', does: 'totals a field over the items' },
+  // The Sort node compares raw values; a - b also orders numeric strings by value
+  sort: { node: 'Sort', nodeType: 'n8n-nodes-base.sort', does: 'sorts items by a field', when: 'the field holds numbers' },
+  // Remove Duplicates compares values; === compares objects and lists by reference
+  removeDuplicates: { node: 'Remove Duplicates', nodeType: 'n8n-nodes-base.removeDuplicates', does: 'removes duplicate items', when: 'the compared fields hold text or numbers' },
+  // Summarize adds numbers; + also joins strings
+  summarize: { node: 'Summarize', nodeType: 'n8n-nodes-base.summarize', does: 'totals a field over the items', when: 'the field holds numbers' },
   aggregate: { node: 'Aggregate', nodeType: 'n8n-nodes-base.aggregate', does: 'collects item values into one list' },
   splitOut: { node: 'Split Out', nodeType: 'n8n-nodes-base.splitOut', does: 'turns a list field into separate items' },
   httpRequest: { node: 'HTTP Request', nodeType: 'n8n-nodes-base.httpRequest', does: 'makes an HTTP request' },
@@ -389,9 +399,10 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     if (callback.params.length === 3) return isDedupeCallback(callback) ? result('removeDuplicates') : undefined;
     return callback.params.length === 1 && isSimpleCondition(callback) ? result('filter') : undefined;
   }
-  // No Sort suggestion: the Sort node compares raw values (strings lowercased), and
-  // without knowing whether a field holds numbers or numeric strings, a comparator
-  // like a.json.score - b.json.score may order differently.
+  for (const call of callsOnItems('sort')) {
+    if (otherCalls(call).length > 0) return undefined;
+    if (returnedAsItems(call) && isSortKeyComparator(call.arguments[0])) return result('sort');
+  }
   if (methods.has('sort') || methods.has('filter')) return undefined;
 
   if (methods.has('reduce')) {
@@ -484,6 +495,29 @@ function isSimpleCondition(callback: AstNode): boolean {
 }
 
 /**
+ * A comparator that orders by one data field: (a, b) => a.json.x - b.json.x, or b - a
+ * for descending. The Sort node compares the raw values (strings lowercased), so
+ * localeCompare, new Date(...) or Number(...) comparators can order differently, and
+ * a - b matches it only for numbers (see the `when` condition).
+ */
+function isSortKeyComparator(callback: AstNode | undefined): boolean {
+  if (callback?.type !== 'ArrowFunctionExpression' || callback.params.length !== 2) return false;
+  const [a, b] = callback.params.map((param: AstNode) => param.name);
+  const body = callbackResult(callback);
+  if (body?.type !== 'BinaryExpression' || body.operator !== '-') return false;
+  const left = fieldPath(body.left);
+  const right = fieldPath(body.right);
+  return left !== undefined && right !== undefined && isDataPath(left.segments) &&
+    JSON.stringify(left.segments) === JSON.stringify(right.segments) &&
+    ((left.root === a && right.root === b) || (left.root === b && right.root === a));
+}
+
+/** json.<field>...: a data field of an item, not item metadata (pairedItem, binary) */
+function isDataPath(segments: string[]): boolean {
+  return segments.length >= 2 && segments[0] === 'json';
+}
+
+/**
  * (item, index, all) => all.findIndex(other => other.json.id === item.json.id) === index.
  * all.indexOf(item) compares item objects, which are all distinct, so it removes nothing.
  */
@@ -549,7 +583,7 @@ function isFieldEquality(node: AstNode | undefined, a: string, b: string): boole
   const right = fieldPath(node.right);
   // A data field under json (other.json === item.json compares objects, not data), and
   // segment lists compared as lists: item.json['a.b'] is not item.json.a.b
-  if (!left || !right || left.segments.length < 2 || left.segments[0] !== 'json' ||
+  if (!left || !right || !isDataPath(left.segments) ||
       JSON.stringify(left.segments) !== JSON.stringify(right.segments)) return false;
   return (left.root === a && right.root === b) || (left.root === b && right.root === a);
 }
@@ -588,18 +622,16 @@ function isHttpResponse(node: AstNode | undefined): boolean {
   return node?.type === 'AwaitExpression' && isHttpRequestCall(node.argument);
 }
 
-/** items.reduce((sum, item) => sum + item.json.amount, 0): a field totalled from 0 */
+/** items.reduce((sum, item) => sum + item.json.amount, 0): a data field totalled from 0 */
 function isFieldTotal(call: AstNode): boolean {
   const [callback, initial] = call.arguments;
   if (callback?.type !== 'ArrowFunctionExpression' || callback.params.length !== 2) return false;
-  if (initial?.type !== 'Literal' || (initial.value !== 0 && initial.value !== '')) return false;
+  // Starting from '' would join text, not total numbers
+  if (initial?.type !== 'Literal' || initial.value !== 0) return false;
   const body = callbackResult(callback);
   if (body?.type !== 'BinaryExpression' || body.operator !== '+' || !isIdentifier(body.left, callback.params[0].name)) return false;
-  // The added value is a plain field of the item: item.json.amount
-  let field = body.right;
-  if (field.type !== 'MemberExpression') return false;
-  while (field.type === 'MemberExpression' && !field.computed) field = field.object;
-  return isIdentifier(field, callback.params[1].name);
+  const field = fieldPath(body.right);
+  return field !== undefined && field.root === callback.params[1].name && isDataPath(field.segments);
 }
 
 /**
