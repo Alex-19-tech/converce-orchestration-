@@ -47,10 +47,9 @@ describe('findNativeAlternative', () => {
       expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'splitOut', executeOnce: false });
     });
 
-    it('Sort for sorted items, numbers, strings or dates', () => {
+    it('Sort for items sorted by a numeric field, in either direction', () => {
       expect(kindOf(`return $input.all().sort((a, b) => b.json.score - a.json.score);`)).toBe('sort');
-      expect(kindOf(`return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name));`)).toBe('sort');
-      expect(kindOf(`return $input.all().sort((a, b) => new Date(b.json.at) - new Date(a.json.at));`)).toBe('sort');
+      expect(kindOf(`return $input.all().sort((a, b) => a.json.score - b.json.score);`)).toBe('sort');
     });
 
     it('the same suggestions for block-bodied callbacks', () => {
@@ -160,6 +159,10 @@ describe('findNativeAlternative', () => {
       ['a dedupe whose inner item shadows the outer one', `return items.filter((item, i, all) => all.findIndex(item => item.json.id === item.json.id) === i);`],
       ['a list sorted in place next to a filter', `const ignored = $input.first().json.tags.sort();\nreturn $input.all().filter(item => item.json.active);`],
       ['a pairwise precedence comparator', `return items.sort((a, b) => Number(b.json.before.includes(a.json.id)) - Number(a.json.before.includes(b.json.id)));`],
+      ['a localeCompare sort (Sort compares raw lowercased values)', `return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name, 'en'));`],
+      ['a date sort (Sort compares the raw strings)', `return $input.all().sort((a, b) => new Date(b.json.at) - new Date(a.json.at));`],
+      ['a dedupe with loose equality', `return items.filter((item, i, all) => all.findIndex(other => other.json.id == item.json.id) === i);`],
+      ['an item that builds binary data', `return { json: {}, binary: { file: { data: $json.base64, mimeType: 'text/plain' } } };`],
       ['a comparator on different fields', `return items.sort((a, b) => a.json.x - b.json.y);`],
       ['several items per item, flattened', `return $input.all().map(item => [{ json: { id: item.json.id } }, { json: { id: item.json.id } }]).flat();`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],

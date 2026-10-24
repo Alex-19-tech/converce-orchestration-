@@ -368,7 +368,8 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     ...(methods.get('map') ?? []).map(call => call.arguments[0]?.type === 'ArrowFunctionExpression'
       ? callbackResult(call.arguments[0]) : undefined)
   ];
-  if (itemObjects.some(isPairedItem)) return undefined;
+  // ...and items that build binary data ({ json, binary: { ... } }) need code
+  if (itemObjects.some(item => isPairedItem(item) || hasBinaryOutput(item))) return undefined;
 
   if (httpCalls > 0) {
     // One request whose response is what the node returns; run once for all items,
@@ -485,41 +486,20 @@ function isSimpleCondition(callback: AstNode): boolean {
 }
 
 /**
- * A comparator that orders by one field, as the Sort node does:
- * (a, b) => a.json.x - b.json.x, b.json.x - a.json.x, a.json.name.localeCompare(b.json.name),
- * new Date(a.json.at) - new Date(b.json.at), Number(a.json.n) - Number(b.json.n).
+ * A comparator that orders by one numeric field: (a, b) => a.json.x - b.json.x, or
+ * b - a for descending. The Sort node compares the raw values (strings lowercased),
+ * so localeCompare, new Date(...) or Number(...) comparators can order differently.
  */
 function isSortKeyComparator(callback: AstNode | undefined): boolean {
   if (callback?.type !== 'ArrowFunctionExpression' || callback.params.length !== 2) return false;
   const [a, b] = callback.params.map((param: AstNode) => param.name);
   const body = callbackResult(callback);
-  if (!body) return false;
-  const sameKey = (left: AstNode, right: AstNode) => {
-    const l = sortKey(left);
-    const r = sortKey(right);
-    return l !== undefined && r !== undefined && l.wrap === r.wrap &&
-      JSON.stringify(l.segments) === JSON.stringify(r.segments) &&
-      ((l.root === a && r.root === b) || (l.root === b && r.root === a));
-  };
-  if (body.type === 'BinaryExpression' && body.operator === '-') return sameKey(body.left, body.right);
-  if (body.type === 'CallExpression' && propertyName(body.callee) === 'localeCompare' && body.arguments.length === 1) {
-    return sameKey(body.callee.object, body.arguments[0]);
-  }
-  return false;
-}
-
-/** a.json.x, new Date(a.json.x) or Number(a.json.x) -> the field read and its wrapper */
-function sortKey(node: AstNode): { root: string; segments: string[]; wrap: string } | undefined {
-  let wrap = '';
-  let inner = node;
-  if ((node.type === 'NewExpression' && isIdentifier(node.callee, 'Date')) ||
-      (node.type === 'CallExpression' && isIdentifier(node.callee, 'Number'))) {
-    if (node.arguments.length !== 1) return undefined;
-    wrap = node.callee.name;
-    inner = node.arguments[0];
-  }
-  const path = fieldPath(inner);
-  return path && path.segments.length > 0 ? { ...path, wrap } : undefined;
+  if (body?.type !== 'BinaryExpression' || body.operator !== '-') return false;
+  const left = fieldPath(body.left);
+  const right = fieldPath(body.right);
+  return left !== undefined && right !== undefined && left.segments.length > 0 &&
+    JSON.stringify(left.segments) === JSON.stringify(right.segments) &&
+    ((left.root === a && right.root === b) || (left.root === b && right.root === a));
 }
 
 /**
@@ -552,6 +532,11 @@ function contains(node: AstNode | undefined, target: AstNode): boolean {
   return found;
 }
 
+/** An item object with a binary property */
+function hasBinaryOutput(node: AstNode | undefined): boolean {
+  return node?.type === 'ObjectExpression' && node.properties.some((property: AstNode) => keyName(property) === 'binary');
+}
+
 /** { json: ..., pairedItem: ... } */
 function isPairedItem(node: AstNode | undefined): boolean {
   if (node?.type !== 'ObjectExpression') return false;
@@ -577,7 +562,8 @@ function isFieldEquality(node: AstNode | undefined, a: string, b: string): boole
   if (node.type === 'LogicalExpression' && node.operator === '&&') {
     return isFieldEquality(node.left, a, b) && isFieldEquality(node.right, a, b);
   }
-  if (node.type !== 'BinaryExpression' || !['===', '=='].includes(node.operator)) return false;
+  // == coerces (0 == '' == '0' is not transitive); Remove Duplicates compares values
+  if (node.type !== 'BinaryExpression' || node.operator !== '===') return false;
   const left = fieldPath(node.left);
   const right = fieldPath(node.right);
   // Compare segment lists: item.json['a.b'] is not item.json.a.b
