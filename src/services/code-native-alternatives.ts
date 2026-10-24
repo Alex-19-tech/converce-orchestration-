@@ -59,13 +59,34 @@ export const MAX_CODE_CHARS = 5000;
 /** Array methods whose callback may be a one-expression arrow function. */
 const CALLBACK_METHODS = new Set(['map', 'filter', 'sort', 'reduce', 'find', 'some', 'every', 'flatMap', 'findIndex']);
 
-/** Calls that mean parsing, side effects, state or anything a node field can't express. */
-const DISQUALIFYING_METHODS = new Set([
-  'parse', 'match', 'matchAll', 'replace', 'replaceAll', 'split', 'test', 'exec',
-  'forEach', 'push', 'pop', 'shift', 'unshift', 'splice', 'concat', 'fill',
-  'apply', 'call', 'bind',
-  'log', 'info', 'warn', 'error', 'debug',
-  'getWorkflowStaticData', 'evaluateExpression', 'then', 'catch'
+/**
+ * The only calls the code may make: reading items and other nodes, and value
+ * formatting a node field expression does as well. Any other call (parsing,
+ * side effects such as $execution.customData.set(), state, libraries) means
+ * code.
+ */
+const ALLOWED_FUNCTIONS = new Set([
+  '$', '$items', 'String', 'Number', 'Boolean', 'parseInt', 'parseFloat',
+  'encodeURIComponent', 'decodeURIComponent', 'encodeURI'
+]);
+const ALLOWED_METHODS = new Set([
+  // items and other nodes
+  'first', 'last', 'all',
+  // array methods with a callback (checked separately) and plain list methods
+  ...CALLBACK_METHODS, 'join', 'slice', 'flat', 'includes', 'indexOf', 'reverse',
+  // strings
+  'trim', 'trimStart', 'trimEnd', 'toLowerCase', 'toUpperCase', 'substring', 'substr',
+  'padStart', 'padEnd', 'startsWith', 'endsWith', 'charAt', 'lastIndexOf', 'toString', 'fromCharCode',
+  // numbers and Math
+  'toFixed', 'toLocaleString', 'floor', 'ceil', 'round', 'abs', 'min', 'max', 'random',
+  // dates (Date and Luxon)
+  'now', 'getTime', 'toISOString', 'toLocaleDateString', 'toLocaleTimeString', 'getFullYear', 'getMonth',
+  'getDate', 'getDay', 'getHours', 'getMinutes', 'toISO', 'toFormat', 'toMillis', 'plus', 'minus',
+  'startOf', 'endOf', 'setZone',
+  // JSON.stringify
+  'stringify',
+  // the single request of the HTTP Request case
+  'httpRequest'
 ]);
 const DISQUALIFYING_IDENTIFIERS = new Set([
   'require', 'Buffer', 'crypto', 'process', 'eval', 'Function', 'fetch', 'setTimeout', 'setInterval',
@@ -269,13 +290,16 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
         break;
       }
       case 'CallExpression': {
-        // A plain call like require(...) is caught by the Identifier case
-        const method = propertyName(node.callee);
-        if (!method) break;
+        const callee = node.callee;
+        if (callee.type === 'Identifier') {
+          if (!ALLOWED_FUNCTIONS.has(callee.name)) disqualified = true;
+          break;
+        }
+        const method = propertyName(callee);
+        if (!method || !ALLOWED_METHODS.has(method)) { disqualified = true; break; }
         if (isHttpRequestCall(node)) { httpCalls++; break; }
-        if (DISQUALIFYING_METHODS.has(method)) { disqualified = true; break; }
         // Object.keys/entries/assign (dynamic keys) and any other helper need code
-        const object = node.callee.object;
+        const object = callee.object;
         if (isIdentifier(object, 'Object') || isHelpers(object)) { disqualified = true; break; }
         if (CALLBACK_METHODS.has(method)) methods.set(method, [...(methods.get(method) ?? []), node]);
         break;
@@ -286,13 +310,16 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   if (disqualified || returns.length === 0) return undefined;
   if (reusesComputedVariable(program, inits)) return undefined;
 
-  /** Follow variables to their initializer and drop a trailing .slice() or .flat(). */
+  /**
+   * Follow variables to their initializer and drop a trailing .flat(). A .slice()
+   * is not dropped: it keeps some items, which a node after Sort or Filter
+   * (Limit) would have to do.
+   */
   const resolve = (node: AstNode | undefined, depth = 0): AstNode | undefined => {
     if (!node || depth > 5) return node;
     if (node.type === 'Identifier' && inits.has(node.name)) return resolve(inits.get(node.name), depth + 1);
-    if (node.type === 'CallExpression' && ['slice', 'flat'].includes(propertyName(node.callee) ?? '')) {
-      return resolve(node.callee.object, depth + 1);
-    }
+    if (node.type === 'ChainExpression') return resolve(node.expression, depth + 1);
+    if (node.type === 'CallExpression' && propertyName(node.callee) === 'flat') return resolve(node.callee.object, depth + 1);
     return node;
   };
   const isItems = (node: AstNode | undefined) => isItemsSource(resolve(node));
@@ -318,8 +345,10 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   if (!returnShapesOk) return undefined;
 
   if (httpCalls > 0) {
-    // One request and nothing else worth code; run once for all items, it is one request
-    return httpCalls === 1 && methods.size === 0 ? result('httpRequest', !perItem) : undefined;
+    // One request whose response is what the node returns; run once for all items,
+    // it is one request
+    const returnsResponse = returns.every(ret => isHttpResponse(unwrapItem(resolve(ret.argument), resolve)));
+    return httpCalls === 1 && methods.size === 0 && returnsResponse ? result('httpRequest', !perItem) : undefined;
   }
 
   for (const call of callsOnItems('filter')) {
@@ -355,17 +384,22 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     if (!mapped) return undefined;
     const returned = returnedAsItems(call);
 
+    const param = callback.params[0]?.name;
     if (isItems(call.callee.object)) {
       // items.map(item => ({ json: {...} })) maps fields, one item per item
       if (returned) return buildsFields(mapped, resolve) ? result('editFields') : undefined;
       // items.map(...).join('\n') builds one text: Edit Fields run once
       if (isJoined(call, program)) return result('editFields', true);
-      // collected into a field of one item it aggregates
-      return usedAsFieldValue(call) ? result('aggregate') : undefined;
+      // A field (or fields) read from each item, collected into one item: Aggregate.
+      // Computed values (price * qty) are not something Aggregate does.
+      return usedAsFieldValue(call) && isProjection(mapped, param) ? result('aggregate') : undefined;
     }
-    // A list field turned into items: $json.rows.map(row => ({ json: row }))
-    return mapped.type === 'ObjectExpression' && returned && isInputField(resolve(call.callee.object))
-      ? result('splitOut')
+    // A list field turned into items, each made of the row's own fields:
+    // $json.rows.map(row => ({ json: { id: row.id } })). Run once for all items,
+    // $json is the first item, so Split Out has to run once too.
+    return mapped.type === 'ObjectExpression' && isProjection(mapped, param) && returned &&
+      isInputField(resolve(call.callee.object))
+      ? result('splitOut', !perItem)
       : undefined;
   }
 
@@ -430,15 +464,65 @@ function isDedupeCallback(callback: AstNode): boolean {
   const method = propertyName(lookup.callee);
   if (method === 'indexOf') return isIdentifier(lookup.arguments[0], item);
   if (method !== 'findIndex') return false;
-  // The inner predicate compares fields of the two items and nothing else
+  // The inner predicate says the two items have equal fields: other.json.id === item.json.id
   const inner = lookup.arguments[0];
   if (inner?.type !== 'ArrowFunctionExpression' || inner.params.length !== 1) return false;
-  let ok = true;
-  walk(inner.body, (node, parent) => {
-    if (node.type === 'CallExpression' || node.type === 'ArrowFunctionExpression') ok = false;
-    if (node.type === 'Identifier' && !isPropertyName(node, parent) && node.name !== item && node.name !== inner.params[0].name) ok = false;
-  });
-  return ok;
+  return isFieldEquality(callbackResult(inner), inner.params[0].name, item);
+}
+
+/** a.json.x === b.json.x, optionally joined with && for several fields */
+function isFieldEquality(node: AstNode | undefined, a: string, b: string): boolean {
+  if (!node) return false;
+  if (node.type === 'LogicalExpression' && node.operator === '&&') {
+    return isFieldEquality(node.left, a, b) && isFieldEquality(node.right, a, b);
+  }
+  if (node.type !== 'BinaryExpression' || !['===', '=='].includes(node.operator)) return false;
+  const left = fieldPath(node.left);
+  const right = fieldPath(node.right);
+  if (!left || !right || left.path !== right.path || left.path === '') return false;
+  return (left.root === a && right.root === b) || (left.root === b && right.root === a);
+}
+
+/** item.json.address.city -> { root: 'item', path: 'json.address.city' } */
+function fieldPath(node: AstNode): { root: string; path: string } | undefined {
+  const names: string[] = [];
+  let current = node.type === 'ChainExpression' ? node.expression : node;
+  while (current.type === 'MemberExpression') {
+    const name = propertyName(current);
+    if (name === undefined) return undefined;
+    names.unshift(name);
+    current = current.object;
+  }
+  return current.type === 'Identifier' ? { root: current.name, path: names.join('.') } : undefined;
+}
+
+/**
+ * A value read straight from the callback's item, or an object of such values:
+ * row.id, { id: row.id, name: row.name }, { json: row }.
+ */
+function isProjection(node: AstNode | undefined, param: string | undefined): boolean {
+  if (!node || !param) return false;
+  if (node.type === 'ChainExpression') return isProjection(node.expression, param);
+  if (node.type === 'ObjectExpression') {
+    return node.properties.length > 0 && node.properties.every((property: AstNode) =>
+      property.type === 'Property' && !property.computed && (keyName(property) === 'pairedItem' || isProjection(property.value, param)));
+  }
+  return fieldPath(node)?.root === param;
+}
+
+/** { json: X } or [{ json: X }] -> X */
+function unwrapItem(node: AstNode | undefined, resolve: (node: AstNode | undefined) => AstNode | undefined): AstNode | undefined {
+  let value = node;
+  if (value?.type === 'ArrayExpression' && value.elements.length === 1) value = resolve(value.elements[0]);
+  if (value?.type === 'ObjectExpression' && value.properties.length === 1 && keyName(value.properties[0]) === 'json') {
+    value = resolve(value.properties[0].value);
+  }
+  return value;
+}
+
+/** await this.helpers.httpRequest(...) */
+function isHttpResponse(node: AstNode | undefined): boolean {
+  return node?.type === 'AwaitExpression' && isHttpRequestCall(node.argument);
 }
 
 /** items.reduce((sum, item) => sum + item.json.amount, 0): a field totalled from 0 */

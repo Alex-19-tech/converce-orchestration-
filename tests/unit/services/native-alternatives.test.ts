@@ -41,12 +41,14 @@ describe('findNativeAlternative', () => {
       expect(kindOf(`const values = $input.all().map(item => item.json.id);\nreturn [{ json: { values } }];`)).toBe('aggregate');
     });
 
-    it('Split Out for a list field turned into items', () => {
-      expect(kindOf(`const rows = $json.pages;\nreturn rows.map(row => ({ json: { markdown: row.markdown } }));`)).toBe('splitOut');
+    it('Split Out for a list field turned into items, run once in all-items mode', () => {
+      const code = `const rows = $json.pages;\nreturn rows.map(row => ({ json: { markdown: row.markdown } }));`;
+      expect(findNativeAlternative(code)).toMatchObject({ kind: 'splitOut', executeOnce: true });
+      expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'splitOut', executeOnce: false });
     });
 
-    it('Sort for sorted items, also with a slice', () => {
-      expect(kindOf(`const sorted = $input.all().sort((a, b) => b.json.score - a.json.score);\nreturn sorted.slice(0, 4);`)).toBe('sort');
+    it('Sort for sorted items', () => {
+      expect(kindOf(`return $input.all().sort((a, b) => b.json.score - a.json.score);`)).toBe('sort');
     });
 
     it('Filter for items kept by a condition on the item', () => {
@@ -124,6 +126,13 @@ describe('findNativeAlternative', () => {
       ['a getter', `return { json: { get now() { return Date.now(); } } };`],
       ['a comma expression', `return { json: { a: ($json.x, $json.y) } };`],
       ['a tagged template', `return { json: { text: String.raw\`a\\nb\` } };`],
+      ['sorted items cut with slice (Sort keeps every item)', `const sorted = $input.all().sort((a, b) => b.json.score - a.json.score);\nreturn sorted.slice(0, 4);`],
+      ['a list field mapped to computed values', `return $json.rows.map(row => ({ json: { value: row.value * 2 } }));`],
+      ['a findIndex that is not field equality', `return $input.all().filter((item, i, all) => all.findIndex(other => other.json.score >= item.json.score) === i);`],
+      ['computed values collected into a list', `const values = $input.all().map(item => item.json.price * item.json.qty);\nreturn [{ json: { values } }];`],
+      ['a request whose response is discarded', `await this.helpers.httpRequest({ url: 'https://example.com' });\nreturn [{ json: { status: 'done' } }];`],
+      ['a side effect through an unknown call', `$execution.customData.set('processed', 'yes');\nreturn { json: { ok: true } };`],
+      ['a call through an expression', `return { json: { a: ($json.f || String)($json.x) } };`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],
       ['a multi-statement callback', `return $input.all().map(item => { const t = item.json.title; return { json: { t } }; });`],
     ])('%s', (_label, code) => {
@@ -166,6 +175,8 @@ describe('WorkflowValidator native-alternative checks', () => {
   beforeEach(() => {
     byCredential = vi.fn(() => new Map([
       ['notionApi', ['Notion']],
+      ['httpHeaderAuth', ['Some Node']],
+      ['httpMultipleHeadersAuth', ['MCP Client']],
       ['awsApiLike', ['AWS Lambda', 'AWS SNS', 'AWS S3', 'AWS SQS']],
     ]));
     const repository = {
@@ -215,7 +226,7 @@ describe('WorkflowValidator native-alternative checks', () => {
 
     const python = await validator.validateWorkflow(workflowWith({
       type: 'n8n-nodes-base.code',
-      parameters: { language: 'python', pythonCode: 'return [{"json": {"a": 1}}]' },
+      parameters: { language: 'python', pythonCode: 'return [{"json": {"a": 1}}]', jsCode: `return { json: { a: $json.a } };` },
     }) as any, { profile: 'strict' });
     expect(python.warnings.some(w => w.code === 'NATIVE_ALTERNATIVE')).toBe(false);
   });
@@ -234,7 +245,7 @@ describe('WorkflowValidator native-alternative checks', () => {
   });
 
   it('says nothing for generic, widely shared or unknown credentials, or outside the advisory profiles', async () => {
-    for (const credential of ['httpHeaderAuth', 'awsApiLike', 'someUnknownApi']) {
+    for (const credential of ['httpHeaderAuth', 'httpMultipleHeadersAuth', 'awsApiLike', 'someUnknownApi']) {
       const result = await validator.validateWorkflow(httpWith(credential) as any, { profile: 'strict' });
       expect(result.suggestions.some(s => s.startsWith('HTTP Request node')), credential).toBe(false);
     }

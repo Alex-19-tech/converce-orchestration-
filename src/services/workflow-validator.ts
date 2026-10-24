@@ -46,11 +46,13 @@ export const VALID_CONNECTION_TYPES = new Set<string>([
   'ai_reranker',
 ]);
 
-/** Credential types any HTTP API can use; they say nothing about a native node. */
-const GENERIC_CREDENTIAL_TYPES = new Set([
-  'httpBasicAuth', 'httpDigestAuth', 'httpHeaderAuth', 'httpQueryAuth', 'httpBearerAuth',
-  'httpCustomAuth', 'httpSslAuth', 'oAuth1Api', 'oAuth2Api'
-]);
+/**
+ * Credential types any HTTP API can use (httpHeaderAuth, httpMultipleHeadersAuth,
+ * oAuth2Api, ...); they say nothing about a native node.
+ */
+function isGenericCredentialType(type: string): boolean {
+  return type.startsWith('http') || ['oAuth1Api', 'oAuth2Api', 'jwtAuth'].includes(type);
+}
 
 /** Credential type -> native node names, computed once per repository. */
 const ACTION_NODES_BY_CREDENTIAL = new WeakMap<object, Map<string, string[]>>();
@@ -1523,7 +1525,7 @@ export class WorkflowValidator {
     const parameters = node.parameters ?? {};
     const credentialType = parameters.nodeCredentialType;
     if (parameters.authentication !== 'predefinedCredentialType' || typeof credentialType !== 'string') return;
-    if (GENERIC_CREDENTIAL_TYPES.has(credentialType)) return;
+    if (isGenericCredentialType(credentialType)) return;
 
     const nodes = this.actionNodesByCredential()?.get(credentialType);
     // A credential shared by many nodes (aws, googleApi) does not say which node fits
