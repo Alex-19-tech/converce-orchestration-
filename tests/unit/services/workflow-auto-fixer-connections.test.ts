@@ -234,6 +234,25 @@ describe('WorkflowAutoFixer - Connection Fixes', () => {
       expect(connFixes[0].after).toBe('Node2');
     });
 
+    it('should keep the ID key when the node name is reserved', async () => {
+      const workflow = createMockWorkflow(
+        [createMockNode('abc-123', '__proto__'), createMockNode('def-456', 'Node2')],
+        {
+          'abc-123': {
+            main: [[{ node: 'Node2', type: 'main', index: 0 }]]
+          }
+        }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+      expect(result.fixes.filter(f => f.type === 'connection-id-to-name')).toHaveLength(0);
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      if (replaceOp) {
+        expect(Object.getPrototypeOf(replaceOp.connections)).toBe(Object.prototype);
+        expect(replaceOp.connections['abc-123']).toBeDefined();
+      }
+    });
+
     it('should NOT fix when key matches both an ID and a name', async () => {
       // Node with name that looks like an ID of another node
       const workflow = createMockWorkflow(

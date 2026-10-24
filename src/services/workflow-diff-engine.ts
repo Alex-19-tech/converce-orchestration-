@@ -36,6 +36,7 @@ import {
 } from '../types/workflow-diff';
 import { Workflow, WorkflowNode, WorkflowConnection, WorkflowNodeGroup } from '../types/n8n-api';
 import { Logger } from '../utils/logger';
+import { hasOwnKey, isReservedObjectKey, RESERVED_OBJECT_KEYS } from '../utils/object-keys';
 import { GROUP_DESCRIPTION_MAX_LENGTH, repairNodeGroups, toWorkflowNodeGroup } from './node-groups';
 import { sanitizeNode, sanitizeWorkflowNodes } from './node-sanitizer';
 import { isActivatableTrigger } from '../utils/node-type-utils';
@@ -50,7 +51,19 @@ const PATCH_LIMITS = {
 };
 
 // Keys that must never appear in property paths (prototype pollution prevention)
-const DANGEROUS_PATH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const DANGEROUS_PATH_KEYS = RESERVED_OBJECT_KEYS;
+
+type NodeOutputs = WorkflowConnection[string];
+
+// SECURITY (GHSA-ppgm-m8rg-4wqv): read connection maps by own keys only
+function ownOutputs(connections: WorkflowConnection, nodeName: string): NodeOutputs | undefined {
+  return hasOwnKey(connections, nodeName) ? connections[nodeName] : undefined;
+}
+
+function ownOutputSlots(connections: WorkflowConnection, nodeName: string, output: string): NodeOutputs[string] | undefined {
+  const outputs = ownOutputs(connections, nodeName);
+  return outputs && hasOwnKey(outputs, output) ? outputs[output] : undefined;
+}
 
 /**
  * Check if a regex pattern contains constructs known to cause catastrophic backtracking.
@@ -612,6 +625,11 @@ export class WorkflowDiffEngine {
    * Validate a single operation
    */
   private validateOperation(workflow: Workflow, operation: WorkflowDiffOperation): string | null {
+    const reservedKeyError = this.validateReservedKeys(workflow, operation);
+    if (reservedKeyError) {
+      return reservedKeyError;
+    }
+
     switch (operation.type) {
       case 'addNode':
         return this.validateAddNode(workflow, operation);
@@ -653,6 +671,53 @@ export class WorkflowDiffEngine {
         return this.validateReplaceConnections(workflow, operation);
       default:
         return `Unknown operation type: ${(operation as any).type}`;
+    }
+  }
+
+  // SECURITY (GHSA-ppgm-m8rg-4wqv): reject reserved node names and connection keys
+  private validateReservedKeys(workflow: Workflow, operation: WorkflowDiffOperation): string | null {
+    const reservedNodeName = (name: unknown) =>
+      isReservedObjectKey(name) ? `Node name "${name}" is reserved and cannot be used` : null;
+    const reservedConnectionKey = (key: unknown) =>
+      isReservedObjectKey(key) ? `Connection type "${String(key)}" is reserved and cannot be used` : null;
+    const resolvedName = (ref: unknown) =>
+      typeof ref === 'string' ? this.findNode(workflow, ref, ref)?.name : undefined;
+
+    switch (operation.type) {
+      case 'addNode':
+        return reservedNodeName((operation.node as any)?.name);
+      case 'updateNode': {
+        const updates = operation.updates as any;
+        return updates && typeof updates === 'object' ? reservedNodeName(updates.name) : null;
+      }
+      case 'addConnection':
+      case 'removeConnection':
+      case 'rewireConnection': {
+        const op = operation as any;
+        for (const ref of [op.source, op.target, op.from, op.to]) {
+          const error = reservedNodeName(resolvedName(ref));
+          if (error) return error;
+        }
+        return reservedConnectionKey(op.sourceOutput) ?? reservedConnectionKey(op.targetInput);
+      }
+      case 'replaceConnections': {
+        const connections = operation.connections as any;
+        if (!connections || typeof connections !== 'object') return null;
+        for (const sourceName of Object.keys(connections)) {
+          const error = reservedNodeName(sourceName);
+          if (error) return error;
+          const outputs = connections[sourceName];
+          if (outputs && typeof outputs === 'object') {
+            for (const outputName of Object.keys(outputs)) {
+              const outputError = reservedConnectionKey(outputName);
+              if (outputError) return outputError;
+            }
+          }
+        }
+        return null;
+      }
+      default:
+        return null;
     }
   }
 
@@ -772,7 +837,7 @@ export class WorkflowDiffEngine {
       );
     });
     
-    if (hasConnections || workflow.connections[node.name]) {
+    if (hasConnections || ownOutputs(workflow.connections, node.name)) {
       // This is a warning, not an error - connections will be cleaned up
       logger.warn(`Removing node "${node.name}" will break existing connections`);
     }
@@ -1030,7 +1095,7 @@ export class WorkflowDiffEngine {
     // from output 0 to target T would falsely block adding output 1 → T (#738).
     // silent: true so warnings are emitted by the apply phase only (avoids duplicates).
     const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation, { silent: true });
-    const existing = workflow.connections[sourceNode.name]?.[sourceOutput];
+    const existing = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput);
     if (existing) {
       const slot = existing[sourceIndex];
       if (Array.isArray(slot) && slot.some(c => c.node === targetNode.name)) {
@@ -1070,7 +1135,7 @@ export class WorkflowDiffEngine {
     }
 
     const sourceOutput = operation.sourceOutput || 'main';
-    const connections = workflow.connections[sourceNode.name]?.[sourceOutput];
+    const connections = ownOutputSlots(workflow.connections, sourceNode.name, String(sourceOutput));
     if (!connections) {
       return `No connections found from "${sourceNode.name}"`;
     }
@@ -1127,7 +1192,7 @@ export class WorkflowDiffEngine {
     const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation, { silent: true });
 
     // Validate that connection from source to "from" exists at the specific index
-    const connections = workflow.connections[sourceNode.name]?.[sourceOutput];
+    const connections = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput);
     if (!connections) {
       return `No connections found from "${sourceNode.name}" on output "${sourceOutput}"`;
     }
@@ -1487,18 +1552,24 @@ export class WorkflowDiffEngine {
     }
     const targetIndex = operation.targetIndex ?? 0;
 
+    // SECURITY (GHSA-ppgm-m8rg-4wqv): slot index must be an array index
+    if (!Number.isInteger(sourceIndex) || sourceIndex < 0) {
+      throw new Error(`sourceIndex must be a non-negative integer, received ${JSON.stringify(sourceIndex)}`);
+    }
+
     // Initialize source node connections object
-    if (!workflow.connections[sourceNode.name]) {
-      workflow.connections[sourceNode.name] = {};
+    let nodeOutputs = ownOutputs(workflow.connections, sourceNode.name);
+    if (!nodeOutputs) {
+      nodeOutputs = {};
+      workflow.connections[sourceNode.name] = nodeOutputs;
     }
 
     // Initialize output type array
-    if (!workflow.connections[sourceNode.name][sourceOutput]) {
-      workflow.connections[sourceNode.name][sourceOutput] = [];
+    let outputArray = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput);
+    if (!outputArray) {
+      outputArray = [];
+      nodeOutputs[sourceOutput] = outputArray;
     }
-
-    // Get reference to output array for clarity
-    const outputArray = workflow.connections[sourceNode.name][sourceOutput];
 
     // Ensure we have connection arrays up to and including the target sourceIndex
     while (outputArray.length <= sourceIndex) {
@@ -1526,22 +1597,22 @@ export class WorkflowDiffEngine {
     }
     
     const sourceOutput = String(operation.sourceOutput ?? 'main');
-    const connections = workflow.connections[sourceNode.name]?.[sourceOutput];
-    if (!connections) return;
+    const nodeOutputs = ownOutputs(workflow.connections, sourceNode.name);
+    const connections = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput);
+    if (!nodeOutputs || !connections) return;
 
     // Remove connection from all indices
-    workflow.connections[sourceNode.name][sourceOutput] = connections.map(branch =>
+    const outputConnections = connections.map(branch =>
       filterBranch(branch, conn => conn.node !== targetNode.name)
     );
-
-    const outputConnections = workflow.connections[sourceNode.name][sourceOutput];
+    nodeOutputs[sourceOutput] = outputConnections;
     trimTrailingEmptyBranches(outputConnections);
 
     if (outputConnections.length === 0) {
-      delete workflow.connections[sourceNode.name][sourceOutput];
+      delete nodeOutputs[sourceOutput];
     }
     
-    if (Object.keys(workflow.connections[sourceNode.name]).length === 0) {
+    if (Object.keys(nodeOutputs).length === 0) {
       delete workflow.connections[sourceNode.name];
     }
   }
@@ -1590,11 +1661,11 @@ export class WorkflowDiffEngine {
     // entire output (not just the specific sourceIndex). A per-slot count
     // would throw spuriously when multiple edges to "from" existed.
     const totalFromEdges = (): number => {
-      const slots = workflow.connections[sourceNode.name]?.[sourceOutput] ?? [];
+      const slots = ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput) ?? [];
       return slots.reduce((acc, slot) => acc + (slot ?? []).filter(c => c.node === fromNode.name).length, 0);
     };
     const fromEdgesBefore = totalFromEdges();
-    const toAlreadyPresent = (workflow.connections[sourceNode.name]?.[sourceOutput]?.[sourceIndex] ?? [])
+    const toAlreadyPresent = (ownOutputSlots(workflow.connections, sourceNode.name, sourceOutput)?.[sourceIndex] ?? [])
       .some(c => c.node === toNode.name);
 
     // Remove source → from using resolved names (not raw op strings, which may
@@ -2077,12 +2148,10 @@ export class WorkflowDiffEngine {
     const renames = new Map(this.renameMap);
 
     // Step 1: Update connection object keys (source node names)
-    const updatedConnections: WorkflowConnection = {};
-    for (const [sourceName, outputs] of Object.entries(workflow.connections)) {
-      // Check if this source node was renamed
-      const newSourceName = renames.get(sourceName) || sourceName;
-      updatedConnections[newSourceName] = outputs;
-    }
+    // SECURITY (GHSA-ppgm-m8rg-4wqv): fromEntries defines own keys
+    const updatedConnections: WorkflowConnection = Object.fromEntries(
+      Object.entries(workflow.connections).map(([sourceName, outputs]) => [renames.get(sourceName) || sourceName, outputs])
+    );
 
     // Step 2: Update target node references within connections
     for (const [sourceName, outputs] of Object.entries(updatedConnections)) {

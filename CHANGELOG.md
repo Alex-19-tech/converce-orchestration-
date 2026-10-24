@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.98.1] - 2026-10-24
+
+### Security
+
+- Fix prototype pollution in the workflow auto-fixer and in connection handling for partial workflow updates (GHSA-ppgm-m8rg-4wqv). Reported by Zachariah Mithani (@zachariah-mithani, AploSec).
+- `n8n_update_partial_workflow` now rejects the node names `__proto__`, `constructor` and `prototype`, and connection types with those names.
+
 ## [2.98.0] - 2026-10-24
 
 ### Added

@@ -17,12 +17,19 @@ import {
 } from '../types/workflow-diff';
 import { WorkflowNode, Workflow } from '../types/n8n-api';
 import { Logger } from '../utils/logger';
+import { hasOwnKey, isReservedObjectKey } from '../utils/object-keys';
 import { NodeVersionService } from './node-version-service';
 import { BreakingChangeDetector } from './breaking-change-detector';
 import { NodeMigrationService } from './node-migration-service';
 import { PostUpdateValidator, PostUpdateGuidance } from './post-update-validator';
 
 const logger = new Logger({ prefix: '[WorkflowAutoFixer]' });
+
+/** Object key of a path segment, without any trailing array index ("items[0]" -> "items"). */
+function pathSegmentKey(segment: string): string {
+  const bracket = segment.indexOf('[');
+  return bracket === -1 ? segment : segment.slice(0, bracket);
+}
 
 export type FixConfidenceLevel = 'high' | 'medium' | 'low';
 export type FixType =
@@ -257,6 +264,11 @@ export class WorkflowAutoFixer {
         // Apply the fix to parameters
         // The fieldPath doesn't include node name, use as is
         const fieldPath = issue.fieldPath.split('.');
+        // SECURITY (GHSA-ppgm-m8rg-4wqv): skip fields with reserved key segments
+        if (fieldPath.some(segment => isReservedObjectKey(pathSegmentKey(segment)))) {
+          logger.warn('Skipping expression format fix for reserved field path', { node: nodeName });
+          continue;
+        }
         this.setNestedValue(updatedParameters, fieldPath, issue.correctedValue);
 
         fixes.push({
@@ -577,6 +589,12 @@ export class WorkflowAutoFixer {
       throw new Error('Cannot set value with empty path');
     }
 
+    // SECURITY (GHSA-ppgm-m8rg-4wqv): reject reserved keys before walking the path
+    const reservedSegment = path.find(segment => isReservedObjectKey(pathSegmentKey(segment)));
+    if (reservedSegment !== undefined) {
+      throw new Error(`Cannot set value: path contains a reserved key (${pathSegmentKey(reservedSegment)})`);
+    }
+
     try {
       let current = obj;
 
@@ -597,7 +615,7 @@ export class WorkflowAutoFixer {
             throw new Error(`Invalid array index: ${indexStr}`);
           }
 
-          if (!current[arrayKey]) {
+          if (!hasOwnKey(current, arrayKey) || !current[arrayKey]) {
             current[arrayKey] = [];
           }
 
@@ -611,7 +629,7 @@ export class WorkflowAutoFixer {
 
           current = current[arrayKey][index];
         } else {
-          if (current[key] === null || current[key] === undefined) {
+          if (!hasOwnKey(current, key) || current[key] === null || current[key] === undefined) {
             current[key] = {};
           }
 
@@ -639,7 +657,7 @@ export class WorkflowAutoFixer {
           throw new Error(`Invalid array index: ${indexStr}`);
         }
 
-        if (!current[arrayKey]) {
+        if (!hasOwnKey(current, arrayKey) || !current[arrayKey]) {
           current[arrayKey] = [];
         }
 
@@ -969,6 +987,8 @@ export class WorkflowAutoFixer {
       newKeyCount.set(r.newKey, (newKeyCount.get(r.newKey) || 0) + 1);
     }
     const safeRenames = renames.filter(r => {
+      // SECURITY (GHSA-ppgm-m8rg-4wqv): keep the ID key for reserved node names
+      if (isReservedObjectKey(r.newKey)) return false;
       if ((newKeyCount.get(r.newKey) || 0) > 1) {
         logger.warn(`Skipping ambiguous ID-to-name rename: "${r.oldKey}" → "${r.newKey}" (multiple IDs map to same name)`);
         return false;
