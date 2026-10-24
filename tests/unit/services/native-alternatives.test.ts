@@ -196,6 +196,8 @@ describe('findNativeAlternative', () => {
       ['a token built from a random value', `const seed = Math.random();\nconst token = 'batch-' + seed;\nreturn $input.all().map(item => ({ json: { id: item.json.id, token } }));`],
       ['$now held in a variable', `const stamp = $now;\nreturn $input.all().map(item => ({ json: { id: item.json.id, stamp } }));`],
       ['a timestamp shared through an alias', `const now = new Date().toISOString();\nconst stamp = now;\nreturn $input.all().map(item => ({ json: { id: item.json.id, stamp } }));`],
+      ['$input held in an object', `const context = { input: $input };\nreturn { json: { count: context.input.all().length } };`],
+      ['a count of $items(undefined)', `return { json: { count: $items(undefined).length } };`],
       ['a count through two aliases', `const all = $input.all();\nconst rows = all;\nreturn { json: { count: rows.length } };`],
       ['an alias of $input', `const inp = $input;\nreturn { json: { count: inp.all().length } };`],
       ['a name declared again in a block', `const source = $('Other').all();\n{ const source = $input.all(); }\nreturn source.filter(item => item.json.active);`],
@@ -288,6 +290,18 @@ describe('WorkflowValidator native-alternative checks', () => {
       'Code node "Step" only totals a field over the items. If the field holds numbers, the Summarize node ' +
       '(n8n-nodes-base.summarize) does this without code. If this needs a Code node, start its notes with "Why Code:" and the reason.'
     );
+  });
+
+  it('keeps Execute Once when the Code node already has it', async () => {
+    const filterCode = (extra: Record<string, any>) => workflowWith({
+      type: 'n8n-nodes-base.code',
+      parameters: { jsCode: `return $input.all().filter(item => item.json.active);` },
+      ...extra,
+    });
+    const plain = await validator.validateWorkflow(filterCode({}) as any, { profile: 'runtime' });
+    expect(plain.suggestions.find(s => s.includes('Filter'))).not.toContain('"Execute Once"');
+    const once = await validator.validateWorkflow(filterCode({ executeOnce: true }) as any, { profile: 'runtime' });
+    expect(once.suggestions.find(s => s.includes('Filter'))).toContain('"Execute Once"');
   });
 
   it('suggests under runtime and says nothing under minimal', async () => {

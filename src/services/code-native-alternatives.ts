@@ -269,6 +269,10 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
         break;
       case 'Identifier':
         if (DISQUALIFYING_IDENTIFIERS.has(node.name)) disqualified = true;
+        // $input passed around (const inp = $input, { input: $input }) hides which items are read
+        if (node.name === '$input' && !isPropertyName(node, parent) && !(parent?.type === 'MemberExpression' && parent.object === node)) {
+          disqualified = true;
+        }
         break;
       case 'ReturnStatement':
         returns.push(node);
@@ -276,10 +280,8 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
       case 'VariableDeclarator':
         // Destructuring, a variable filled in later, or one that hides a global or
         // n8n name (const String = ...) needs code
-        // A name declared twice (block scopes) or a variable holding $input itself
-        // (const inp = $input) would be resolved wrongly below
-        if (node.id.type === 'Identifier' && node.init && !isReservedName(node.id.name) && !inits.has(node.id.name) &&
-            !isIdentifier(node.init, '$input')) {
+        // A name declared twice (block scopes) would be resolved wrongly below
+        if (node.id.type === 'Identifier' && node.init && !isReservedName(node.id.name) && !inits.has(node.id.name)) {
           inits.set(node.id.name, node.init);
         } else {
           disqualified = true;
@@ -574,9 +576,9 @@ function readsBeyondFirstItem(program: AstNode, inits: Map<string, AstNode>): bo
   let reads = false;
   walk(program, (node, parent) => {
     if (reads) return;
-    // $input.last(), or $items() without a node name: this node's input items
+    // $input.last(), or $items() without a literal node name: this node's input items
     if (node.type === 'CallExpression' && ((propertyName(node.callee) === 'last' && isIdentifier(node.callee.object, '$input')) ||
-        (isIdentifier(node.callee, '$items') && node.arguments.length === 0))) {
+        (isIdentifier(node.callee, '$items') && typeof node.arguments[0]?.value !== 'string'))) {
       reads = true;
       return;
     }

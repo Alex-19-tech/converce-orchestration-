@@ -1503,7 +1503,8 @@ export class WorkflowValidator {
     const alternative = findNativeAlternative(parameters.jsCode, parameters.mode);
     if (!alternative) return;
 
-    const runOnce = alternative.executeOnce ? ' with its "Execute Once" setting on' : '';
+    // A Code node set to execute once sees only its first input item; so must the native node
+    const runOnce = alternative.executeOnce || node.executeOnce === true ? ' with its "Execute Once" setting on' : '';
     const nativeNode = `the ${alternative.node} node (${alternative.nodeType})${runOnce} does this without code.`;
     const message = `Code node "${node.name}" only ${alternative.does}. ` +
       (alternative.when ? `If ${alternative.when}, ${nativeNode}` : nativeNode.charAt(0).toUpperCase() + nativeNode.slice(1)) +
