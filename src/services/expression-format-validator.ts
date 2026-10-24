@@ -10,6 +10,7 @@
 import { UniversalExpressionValidator, UniversalValidationResult } from './universal-expression-validator';
 import { ConfidenceScorer } from './confidence-scorer';
 import type { ValidationProfile } from './enhanced-config-validator';
+import { isReservedObjectKey } from '../utils/object-keys';
 
 export interface ExpressionFormatIssue {
   fieldPath: string;
@@ -347,6 +348,8 @@ export class ExpressionFormatValidator {
       Object.entries(obj).forEach(([key, value]) => {
         // Skip special keys
         if (key.startsWith('__')) return;
+        // SECURITY (GHSA-ppgm-m8rg-4wqv): skip keys with reserved path segments
+        if (key.split('.').some(isReservedObjectKey)) return;
 
         // Skip raw code fields — they hold JavaScript / Python source, not n8n expressions.
         // The bracket-balance check in UniversalExpressionValidator counts {{ vs }} occurrences

@@ -628,4 +628,18 @@ describe('ExpressionFormatValidator', () => {
       expect(issues.some(i => i.fieldPath === 'body')).toBe(true);
     });
   });
+
+  describe('reserved parameter keys', () => {
+    const context = { nodeType: 'n8n-nodes-base.httpRequest', nodeName: 'HTTP Request', nodeId: 'test-id-1' };
+
+    it('should not report fields whose key contains a reserved path segment', () => {
+      const params = {
+        'a.__proto__.polluted': '{{ $json.x }}',
+        'constructor': { prototype: { polluted: '{{ $json.x }}' } },
+        url: '{{ $json.url }}'
+      };
+      const issues = ExpressionFormatValidator.validateNodeParameters(params, context);
+      expect(issues.map(i => i.fieldPath)).toEqual(['url']);
+    });
+  });
 });

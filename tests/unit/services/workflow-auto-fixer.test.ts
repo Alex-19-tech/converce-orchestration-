@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WorkflowAutoFixer, isNodeFormatIssue } from '@/services/workflow-auto-fixer';
 import { NodeRepository } from '@/database/node-repository';
 import type { WorkflowValidationResult } from '@/services/workflow-validator';
@@ -243,6 +243,11 @@ describe('WorkflowAutoFixer', () => {
   });
 
   describe('setNestedValue Validation', () => {
+    afterEach(() => {
+      delete (Object.prototype as any).polluted;
+      delete (Object.prototype as any)[0];
+    });
+
     it('should throw error for non-object target', () => {
       expect(() => {
         autoFixer['setNestedValue'](null, ['field'], 'value');
@@ -295,6 +300,71 @@ describe('WorkflowAutoFixer', () => {
       expect(() => {
         autoFixer['setNestedValue'](obj, ['field', 'nested'], 'value');
       }).toThrow('Cannot traverse through string at field');
+    });
+
+    it.each([
+      [['__proto__', 'polluted']],
+      [['a', '__proto__', 'polluted']],
+      [['constructor', 'prototype', 'polluted']],
+      [['items[0]', '__proto__', 'polluted']],
+      [['__proto__[0]', 'polluted']],
+      [['a', 'constructor']]
+    ])('should reject reserved key segments in %j', (path) => {
+      const obj: any = { a: {}, items: [{}] };
+      expect(() => autoFixer['setNestedValue'](obj, path, 'value')).toThrow(/reserved key/);
+      expect(({} as any).polluted).toBeUndefined();
+      expect((Object.prototype as any)[0]).toBeUndefined();
+    });
+
+    it('should create own properties for keys inherited from Object.prototype', () => {
+      const obj: any = {};
+      autoFixer['setNestedValue'](obj, ['toString', 'nested'], 'value');
+      expect(Object.prototype.hasOwnProperty.call(obj, 'toString')).toBe(true);
+      expect(obj.toString.nested).toBe('value');
+      expect((Object.prototype.toString as any).nested).toBeUndefined();
+    });
+  });
+
+  describe('Expression format fixes with reserved parameter keys', () => {
+    afterEach(() => {
+      delete (Object.prototype as any).polluted;
+    });
+
+    it('should skip fields whose path contains a reserved key', async () => {
+      const workflow = createMockWorkflow([
+        createMockNode('node-1', 'nodes-base.httpRequest', {
+          'a.__proto__.polluted': '{{ $json.x }}',
+          url: '{{ $json.url }}'
+        })
+      ]);
+      const formatIssues: ExpressionFormatIssue[] = [
+        {
+          fieldPath: 'a.__proto__.polluted',
+          currentValue: '{{ $json.x }}',
+          correctedValue: '={{ $json.x }}',
+          issueType: 'missing-prefix',
+          severity: 'error',
+          explanation: 'Missing = prefix',
+          nodeName: 'node-1',
+          nodeId: 'node-1'
+        } as any,
+        {
+          fieldPath: 'url',
+          currentValue: '{{ $json.url }}',
+          correctedValue: '={{ $json.url }}',
+          issueType: 'missing-prefix',
+          severity: 'error',
+          explanation: 'Missing = prefix',
+          nodeName: 'node-1',
+          nodeId: 'node-1'
+        } as any
+      ];
+      const validationResult = { valid: false, errors: [], warnings: [], statistics: {} } as any;
+
+      const result = await autoFixer.generateFixes(workflow, validationResult, formatIssues);
+
+      expect(({} as any).polluted).toBeUndefined();
+      expect(result.fixes.map(f => f.field)).toEqual(['url']);
     });
   });
 
