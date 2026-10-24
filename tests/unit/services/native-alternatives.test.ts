@@ -19,6 +19,8 @@ describe('findNativeAlternative', () => {
       ['fields from other nodes', `return { id: $('Create').first().json.id, task: 'Ask for a budget' };`],
       ['items mapped to new fields', `return $input.all().map(item => ({ json: { title: item.json.metadata?.title, url: item.json.url } }));`],
       ['the current item spread with an extra field', `return { json: { ...$json, processedAt: new Date().toISOString() } };`],
+      ['a fixed value from another node shared by mapped items', `const base = $('Config').first().json.url;\nreturn $input.all().map(item => ({ json: { url: base + item.json.path } }));`],
+      ['a timestamp taken per mapped item', `return $input.all().map(item => ({ json: { id: item.json.id, at: new Date().toISOString() } }));`],
     ])('Edit Fields for %s', (_label, code) => {
       expect(kindOf(code)).toBe('editFields');
     });
@@ -189,6 +191,9 @@ describe('findNativeAlternative', () => {
       ['a count of all items in one item', `return { json: { count: $input.all().length } };`],
       ['the last item read into one item', `return { json: { last: $input.last().json.id } };`],
       ['a request body built from all items', `const response = await this.helpers.httpRequest({ method: 'POST', url: 'https://example.com', body: { ids: items.map(i => i.json.id) } });\nreturn [{ json: response }];`],
+      ['a count of $items()', `return { json: { count: $items().length } };`],
+      ['a random value shared by mapped items', `const token = Math.random();\nreturn $input.all().map(item => ({ json: { id: item.json.id, token } }));`],
+      ['a timestamp shared through an alias', `const now = new Date().toISOString();\nconst stamp = now;\nreturn $input.all().map(item => ({ json: { id: item.json.id, stamp } }));`],
       ['a count through two aliases', `const all = $input.all();\nconst rows = all;\nreturn { json: { count: rows.length } };`],
       ['an alias of $input', `const inp = $input;\nreturn { json: { count: inp.all().length } };`],
       ['a name declared again in a block', `const source = $('Other').all();\n{ const source = $input.all(); }\nreturn source.filter(item => item.json.active);`],

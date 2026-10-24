@@ -342,7 +342,7 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   returns.push(...nodeReturns);
   // Without branching, only the first return runs; a second one is dead code
   if (returns.length !== 1) return undefined;
-  if (reusesComputedVariable(program, inits)) return undefined;
+  if (reusesComputedVariable(program, inits) || sharesChangingValue(program, inits)) return undefined;
 
   /**
    * Follow variables to their initializer and drop a trailing .flat(). A .slice()
@@ -574,7 +574,9 @@ function readsBeyondFirstItem(program: AstNode, inits: Map<string, AstNode>): bo
   let reads = false;
   walk(program, (node, parent) => {
     if (reads) return;
-    if (node.type === 'CallExpression' && propertyName(node.callee) === 'last' && isIdentifier(node.callee.object, '$input')) {
+    // $input.last(), or $items() without a node name: this node's input items
+    if (node.type === 'CallExpression' && ((propertyName(node.callee) === 'last' && isIdentifier(node.callee.object, '$input')) ||
+        (isIdentifier(node.callee, '$items') && node.arguments.length === 0))) {
       reads = true;
       return;
     }
@@ -764,6 +766,45 @@ function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): 
     uses.set(node.name, (uses.get(node.name) ?? 0) + 1);
   });
   return [...uses.values()].some(count => count > 1);
+}
+
+/** Math.random(), Date.now(), DateTime.now(), new Date() or $now: a new value on each evaluation. */
+function isChangingValue(node: AstNode): boolean {
+  let changing = false;
+  walk(node, (child) => {
+    if (isIdentifier(child, '$now')) changing = true;
+    if (child.type === 'CallExpression' && ['random', 'now'].includes(propertyName(child.callee) ?? '')) changing = true;
+    if (child.type === 'NewExpression' && child.arguments.length === 0) changing = true;
+  });
+  return changing;
+}
+
+/**
+ * const batchId = Math.random(); items.map(item => ({ json: { ...item.json, batchId } })):
+ * the code gives every item the same value, where a node field evaluates it per item.
+ */
+function sharesChangingValue(program: AstNode, inits: Map<string, AstNode>): boolean {
+  // Variables holding such a value, directly or through other variables
+  const changing = new Set<string>();
+  for (let added = true; added;) {
+    added = false;
+    for (const [name, init] of inits) {
+      if (changing.has(name)) continue;
+      if ((init.type === 'Identifier' && changing.has(init.name)) || (init.type !== 'Identifier' && isChangingValue(init))) {
+        changing.add(name);
+        added = true;
+      }
+    }
+  }
+  if (changing.size === 0) return false;
+  const callbacks: AstNode[] = [];
+  walk(program, (node) => { if (node.type === 'ArrowFunctionExpression') callbacks.push(node); });
+  let shared = false;
+  walk(program, (node, parent) => {
+    if (shared || node.type !== 'Identifier' || !changing.has(node.name) || isPropertyName(node, parent)) return;
+    if (callbacks.some(callback => contains(callback, node))) shared = true;
+  });
+  return shared;
 }
 
 /**
