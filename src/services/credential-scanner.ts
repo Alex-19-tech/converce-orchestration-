@@ -19,6 +19,8 @@ export interface SecretPattern {
   label: string;
   category: string;
   severity: 'critical' | 'high' | 'medium';
+  /** Returns the same match as `regex.exec(text)?.[0]`; used instead of the regex when set. */
+  find?: (text: string) => string | null;
 }
 
 export interface ScanDetection {
@@ -45,6 +47,119 @@ const SKIP_FIELDS = new Set<string>([
   'position',
   'credentials',
 ]);
+
+// ---------------------------------------------------------------------------
+// Pattern finders
+// ---------------------------------------------------------------------------
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bounded matching for open-ended patterns.
+// Each finder returns the same match as an unanchored exec of its regex.
+
+function isWordCode(c: number): boolean {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+}
+
+/** [A-Za-z0-9_-] */
+function isJwtCode(c: number): boolean {
+  return isWordCode(c) || c === 45;
+}
+
+/** [A-Za-z0-9._%+-] */
+function isEmailLocalCode(c: number): boolean {
+  return isWordCode(c) || c === 46 || c === 37 || c === 43 || c === 45;
+}
+
+/** End index of the run matched by a sticky `[...]*` regex starting at `from`. */
+function runEnd(run: RegExp, text: string, from: number): number {
+  run.lastIndex = from;
+  run.exec(text);
+  return run.lastIndex;
+}
+
+function stickyMatch(sticky: RegExp, text: string, at: number): string | null {
+  sticky.lastIndex = at;
+  const match = sticky.exec(text);
+  return match ? match[0] : null;
+}
+
+function jwtFinder(regex: RegExp): (text: string) => string | null {
+  const sticky = new RegExp(regex.source, 'y');
+  return (text) => {
+    let start = text.indexOf('eyJ');
+    while (start !== -1) {
+      let end = start + 3;
+      while (end < text.length && isJwtCode(text.charCodeAt(end))) end++;
+      if (end - start - 3 >= 10) {
+        const match = stickyMatch(sticky, text, start);
+        if (match !== null) return match;
+      }
+      start = text.indexOf('eyJ', end);
+    }
+    return null;
+  };
+}
+
+function emailFinder(regex: RegExp): (text: string) => string | null {
+  const sticky = new RegExp(regex.source, 'y');
+  return (text) => {
+    let at = text.indexOf('@');
+    while (at !== -1) {
+      let runStart = at;
+      while (runStart > 0 && isEmailLocalCode(text.charCodeAt(runStart - 1))) runStart--;
+      for (let start = runStart; start < at; start++) {
+        const prev = start > 0 ? text.charCodeAt(start - 1) : -1;
+        if (prev === 123) continue; // '{'
+        if ((prev !== -1 && isWordCode(prev)) !== isWordCode(text.charCodeAt(start))) {
+          const match = stickyMatch(sticky, text, start);
+          if (match !== null) return match;
+          break;
+        }
+      }
+      at = text.indexOf('@', at + 1);
+    }
+    return null;
+  };
+}
+
+function urlWithAuthFinder(regex: RegExp): (text: string) => string | null {
+  const sticky = new RegExp(regex.source, 'y');
+  const scheme = /(?:https?|postgres|mysql|mongodb|redis|amqp):\/\//g;
+  const userRun = /[^:"\s]*/y;
+  const passRun = /[^@"\s]*/y;
+  const hostChar = /[^\s"]/y;
+  return (text) => {
+    // [passFrom, passEnd): a range with no '@', '"' or whitespace.
+    let passFrom = -1;
+    let passEnd = -1;
+    scheme.lastIndex = 0;
+    let found: RegExpExecArray | null;
+    while ((found = scheme.exec(text)) !== null) {
+      const start = found.index;
+      const userStart = start + found[0].length;
+      const userEnd = runEnd(userRun, text, userStart);
+      if (userEnd > userStart && text.charCodeAt(userEnd) === 58) { // ':'
+        const passStart = userEnd + 1;
+        if (passStart < passFrom || passStart > passEnd) {
+          passFrom = passStart;
+          passEnd = runEnd(passRun, text, passStart);
+        }
+        hostChar.lastIndex = passEnd + 1;
+        if (passEnd > passStart && text.charCodeAt(passEnd) === 64 && hostChar.test(text)) { // '@'
+          const match = stickyMatch(sticky, text, start);
+          if (match !== null) return match;
+        }
+      }
+      scheme.lastIndex = start + 1;
+    }
+    return null;
+  };
+}
+
+function withFinder(
+  pattern: SecretPattern,
+  makeFinder: (regex: RegExp) => (text: string) => string | null,
+): SecretPattern {
+  return { ...pattern, find: makeFinder(pattern.regex) };
+}
 
 // ---------------------------------------------------------------------------
 // Secret patterns (instant reject)
@@ -77,7 +192,7 @@ export const SECRET_PATTERNS: SecretPattern[] = [
   { regex: /ghr_[A-Za-z0-9]{36,}/, label: 'github_refresh', category: 'GitHub', severity: 'critical' },
 
   // ── Auth tokens ──────────────────────────────────────────────────────────
-  { regex: /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, label: 'jwt_token', category: 'Auth tokens', severity: 'critical' },
+  withFinder({ regex: /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, label: 'jwt_token', category: 'Auth tokens', severity: 'critical' }, jwtFinder),
   { regex: /sbp_[a-f0-9]{40,}/, label: 'supabase_secret', category: 'Auth tokens', severity: 'critical' },
 
   // ── Communication ────────────────────────────────────────────────────────
@@ -128,7 +243,7 @@ export const SECRET_PATTERNS: SecretPattern[] = [
   // ── Generic patterns (keep last - catch-all) ────────────────────────────
   { regex: /-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----/, label: 'private_key', category: 'Generic', severity: 'critical' },
   { regex: /Bearer\s+[A-Za-z0-9._-]{32,}/i, label: 'bearer_token', category: 'Generic', severity: 'high' },
-  { regex: /(?:https?|postgres|mysql|mongodb|redis|amqp):\/\/[^:"\s]+:[^@"\s]+@[^\s"]+/, label: 'url_with_auth', category: 'Generic', severity: 'critical' },
+  withFinder({ regex: /(?:https?|postgres|mysql|mongodb|redis|amqp):\/\/[^:"\s]+:[^@"\s]+@[^\s"]+/, label: 'url_with_auth', category: 'Generic', severity: 'critical' }, urlWithAuthFinder),
 ];
 
 // ---------------------------------------------------------------------------
@@ -137,7 +252,7 @@ export const SECRET_PATTERNS: SecretPattern[] = [
 
 export const PII_PATTERNS: SecretPattern[] = [
   // Email addresses (but not template expressions like {{$json.email}})
-  { regex: /(?<!\{)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?!\})/, label: 'email', category: 'PII', severity: 'medium' },
+  withFinder({ regex: /(?<!\{)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b(?!\})/, label: 'email', category: 'PII', severity: 'medium' }, emailFinder),
   // Phone numbers (international formats)
   { regex: /(?<!\d)\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}(?!\d)/, label: 'phone', category: 'PII', severity: 'medium' },
   // Credit card numbers
@@ -238,14 +353,14 @@ function scanText(
 ): void {
   const text = parts.join('\n');
   for (const pattern of ALL_PATTERNS) {
-    const match = pattern.regex.exec(text);
+    const match = pattern.find ? pattern.find(text) : pattern.regex.exec(text)?.[0] ?? null;
     if (match) {
       detections.push({
         label: pattern.label,
         category: pattern.category,
         severity: pattern.severity,
         location,
-        maskedSnippet: maskSecret(match[0]),
+        maskedSnippet: maskSecret(match),
       });
     }
   }

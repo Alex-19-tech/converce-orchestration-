@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { WorkflowAutoFixer } from '@/services/workflow-auto-fixer';
+import { MAX_CONNECTION_INDEX } from '@/services/workflow-diff-engine';
 import { NodeRepository } from '@/database/node-repository';
 import type { WorkflowValidationResult } from '@/services/workflow-validator';
 import type { Workflow, WorkflowNode } from '@/types/n8n-api';
@@ -157,6 +158,41 @@ describe('WorkflowAutoFixer - Connection Fixes', () => {
       expect(replaceOp.connections.Node1['main']).toHaveLength(4);
       expect(replaceOp.connections.Node1['main'][1]).toEqual([]);
       expect(replaceOp.connections.Node1['main'][2]).toEqual([]);
+    });
+
+    it('leaves numeric keys above the connection index limit unconverted', async () => {
+      const tooLarge = String(MAX_CONNECTION_INDEX + 1);
+      const workflow = createMockWorkflow(
+        [createMockNode('id1', 'Node1'), createMockNode('id2', 'Node2'), createMockNode('id3', 'Node3')],
+        {
+          Node1: {
+            '0': [[{ node: 'Node2', type: 'main', index: 0 }]],
+            [tooLarge]: [[{ node: 'Node3', type: 'main', index: 0 }]],
+            '9000000000': [[{ node: 'Node3', type: 'main', index: 0 }]]
+          }
+        }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+      const connFixes = result.fixes.filter(f => f.type === 'connection-numeric-keys');
+      expect(connFixes.map(f => f.before)).toEqual(['0']);
+
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      expect(replaceOp.connections.Node1['main']).toEqual([[{ node: 'Node2', type: 'main', index: 0 }]]);
+      expect(replaceOp.connections.Node1[tooLarge]).toBeDefined();
+      expect(replaceOp.connections.Node1['9000000000']).toBeDefined();
+    });
+
+    it('converts a numeric key at the connection index limit', async () => {
+      const workflow = createMockWorkflow(
+        [createMockNode('id1', 'Node1'), createMockNode('id2', 'Node2')],
+        { Node1: { [String(MAX_CONNECTION_INDEX)]: [[{ node: 'Node2', type: 'main', index: 0 }]] } }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      expect(replaceOp.connections.Node1['main']).toHaveLength(MAX_CONNECTION_INDEX + 1);
+      expect(replaceOp.connections.Node1['main'][MAX_CONNECTION_INDEX]).toEqual([{ node: 'Node2', type: 'main', index: 0 }]);
     });
   });
 

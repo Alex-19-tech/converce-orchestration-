@@ -12,7 +12,7 @@ Deploy n8n-MCP with one click:
 
 Railway deployment provides:
 - ☁️ **Instant cloud hosting** - No server setup required
-- 🔒 **Secure by default** - HTTPS included, auth token warnings
+- 🔒 **Secure by default** - HTTPS included, refuses to start with a placeholder auth token
 - 🌐 **Global access** - Connect from any Claude Desktop
 - ⚡ **Auto-scaling** - Railway handles the infrastructure
 - 📊 **Built-in monitoring** - Logs and metrics included
@@ -26,7 +26,7 @@ Railway deployment provides:
 > # Generate a secure token locally:
 > openssl rand -base64 32
 > ```
-> - **Deploying via the one-click template?** A placeholder `AUTH_TOKEN` is created for you — you **must replace** it with your own secure value (the server warns every 5 minutes until you do).
+> - **Deploying via the one-click template?** A placeholder `AUTH_TOKEN` is created for you — you **must replace** it with your own secure value. The server refuses to start in production until you do.
 > - **Deploying from your own repo/Dockerfile?** Railway does **not** auto-create the variable — you **must add** `AUTH_TOKEN` yourself, or the server will not start.
 >
 > Either way, Railway redeploys automatically once the variable is saved. See [Configure Security](#2-configure-security) below for the full walkthrough.
@@ -47,7 +47,7 @@ Railway deployment provides:
 
 ### 2. Configure Security
 
-**IMPORTANT**: The deployment includes a default AUTH_TOKEN for instant functionality, but you MUST change it:
+**IMPORTANT**: The one-click template creates a placeholder AUTH_TOKEN. You MUST replace it before the server will start:
 
 ![Railway Dashboard - Variables Tab](./img/railway-variables.png)
 
@@ -62,7 +62,7 @@ Railway deployment provides:
    ```
 6. **Railway will automatically redeploy** with the new token
 
-> ⚠️ **Security Warning**: The server displays warnings every 5 minutes until you change the default token!
+> ⚠️ **Security Warning**: The server refuses to start in production while `AUTH_TOKEN` is the placeholder value.
 
 ### 3. Get Your Service URL
 

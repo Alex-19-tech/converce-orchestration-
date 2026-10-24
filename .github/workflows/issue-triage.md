@@ -39,6 +39,7 @@ tools:
   github:
     toolsets: [issues]
     read-only: true
+    allowed-repos: [czlonkowski/n8n-mcp]
     min-integrity: none # Allow this workflow to examine issues from any author. The MCP server is read-only; comments and labels are written via the safe-outputs channel.
 
 environment: agentic-triage

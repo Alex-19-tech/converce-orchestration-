@@ -469,14 +469,21 @@ export class WorkflowValidator {
   private validateNodeGroups(workflow: WorkflowJson, result: WorkflowValidationResult): void {
     if (!Array.isArray(workflow.nodeGroups) || workflow.nodeGroups.length === 0) return;
 
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): one lookup per node type
+    const triggerByType = new Map<string, boolean>();
     const issues = checkNodeGroups(
       { nodes: workflow.nodes as any, nodeGroups: workflow.nodeGroups },
       {
         isTrigger: node => {
-          const nodeInfo = this.nodeRepository.getNode(
-            NodeTypeNormalizer.normalizeToFullForm(node.type)
-          );
-          return nodeInfo ? Boolean(nodeInfo.isTrigger) : isTriggerNode(node.type);
+          let trigger = triggerByType.get(node.type);
+          if (trigger === undefined) {
+            const nodeInfo = this.nodeRepository.getNode(
+              NodeTypeNormalizer.normalizeToFullForm(node.type)
+            );
+            trigger = nodeInfo ? Boolean(nodeInfo.isTrigger) : isTriggerNode(node.type);
+            triggerByType.set(node.type, trigger);
+          }
+          return trigger;
         }
       }
     );

@@ -83,6 +83,27 @@ describe('ConfidenceScorer', () => {
 
       expect(score.value).toBeGreaterThanOrEqual(0.5);
     });
+
+    it('should only match identifier keywords inside an expression on one line', () => {
+      const valueMatched = (value: string) =>
+        ConfidenceScorer.scoreResourceLocatorRecommendation('target', 'n8n-nodes-base.httpRequest', value)
+          .factors.find(f => f.name === 'value-pattern')?.matched;
+
+      expect(valueMatched('={{ $json.user_KEY }}')).toBe(true);
+      expect(valueMatched('=prefix {{ $json.a }} middle {{ $json.path }}')).toBe(true);
+      expect(valueMatched('=id {{ $json.value }}')).toBe(false);
+      expect(valueMatched('={{ $json.value }} id')).toBe(false);
+      expect(valueMatched('={{ $json\n.id }}')).toBe(false);
+    });
+
+    it('handles a long expression value', () => {
+      const start = performance.now();
+      for (const value of ['{{}}' + '{{id'.repeat(1_450), '}}' + '{{.name'.repeat(1_200), '{{}}' + '{{id'.repeat(100_000)]) {
+        const score = ConfidenceScorer.scoreResourceLocatorRecommendation('target', 'n8n-nodes-base.httpRequest', value);
+        expect(score.factors.find(f => f.name === 'value-pattern')?.matched).toBe(false);
+      }
+      expect(performance.now() - start).toBeLessThan(2000);
+    });
   });
 
   describe('getConfidenceLevel', () => {

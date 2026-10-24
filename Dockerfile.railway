@@ -86,7 +86,7 @@ RUN addgroup -g 1001 -S nodejs && \
 USER nodejs
 
 # Set Railway-optimized environment variables
-ENV AUTH_TOKEN="REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh"
+# AUTH_TOKEN (or AUTH_TOKEN_FILE) must be set in the Railway service variables.
 ENV NODE_ENV=production
 ENV IS_DOCKER=true
 ENV MCP_MODE=http

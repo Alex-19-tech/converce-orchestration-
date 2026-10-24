@@ -27,11 +27,8 @@ export function isExpression(value: unknown): value is string {
  * @returns true if the value contains {{ }} markers
  */
 export function containsExpression(value: unknown): boolean {
-  if (typeof value !== 'string') {
-    return false;
-  }
-  // Use single regex for better performance than two includes()
-  return /\{\{.*\}\}/s.test(value);
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of an unanchored regex
+  return hasBracketExpression(value);
 }
 
 /**

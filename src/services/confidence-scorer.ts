@@ -150,14 +150,16 @@ export class ConfidenceScorer {
       return false;
     }
 
-    // Check for patterns that suggest IDs or resource references
-    const patterns = [
-      /\{\{.*\.(id|Id|ID|key|Key|name|Name|path|Path|url|Url|uri|Uri).*\}\}/i,
-      /\{\{.*_(id|Id|ID|key|Key|name|Name|path|Path|url|Url|uri|Uri).*\}\}/i,
-      /\{\{.*(id|Id|ID|key|Key|name|Name|path|Path|url|Url|uri|Uri).*\}\}/i
-    ];
-
-    return patterns.some(pattern => pattern.test(content));
+    // Check for patterns that suggest IDs or resource references: a keyword
+    // between '{{' and a later '}}' on the same line.
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): per-line indexOf scan instead of wildcard regexes
+    const keyword = /id|key|name|path|url|uri/i;
+    return content.split(/[\n\r\u2028\u2029]/).some(line => {
+      const open = line.indexOf('{{');
+      if (open === -1) return false;
+      const close = line.lastIndexOf('}}');
+      return close > open + 2 && keyword.test(line.slice(open + 2, close));
+    });
   }
 
   /**

@@ -19,6 +19,7 @@ import {
   ChatTriggerInput,
 } from '../types';
 import { BaseTriggerHandler } from './base-handler';
+import { describeSizeLimitError, responseSizeLimits } from '../../services/n8n-api-client';
 import { buildTriggerUrl } from '../trigger-detector';
 
 /**
@@ -123,6 +124,8 @@ export class ChatHandler extends BaseTriggerHandler<ChatTriggerInput> {
         maxRedirects: 0,
         httpAgent: pinned?.httpAgent,
         httpsAgent: pinned?.httpsAgent,
+        // SECURITY (GHSA-xvxq-x6hr-xc2c): bound response and request size.
+        ...responseSizeLimits(),
       };
 
       // Make the request (sync mode - no streaming)
@@ -141,7 +144,8 @@ export class ChatHandler extends BaseTriggerHandler<ChatTriggerInput> {
         },
       });
     } catch (error) {
-      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      let errorMessage = describeSizeLimitError(error)
+        ?? (error instanceof Error ? error.message : 'Unknown error');
       if (!errorMessage) {
         // An AggregateError from a multi-address connection failure
         // (autoSelectFamily across the pinned set) has an empty message;

@@ -22,6 +22,7 @@ import { NodeVersionService } from './node-version-service';
 import { BreakingChangeDetector } from './breaking-change-detector';
 import { NodeMigrationService } from './node-migration-service';
 import { PostUpdateValidator, PostUpdateGuidance } from './post-update-validator';
+import { MAX_CONNECTION_INDEX } from './workflow-diff-engine';
 
 const logger = new Logger({ prefix: '[WorkflowAutoFixer]' });
 
@@ -904,7 +905,12 @@ export class WorkflowAutoFixer {
 
     for (const sourceName of sourceNodes) {
       const nodeConn = conn[sourceName];
-      const numericKeys = Object.keys(nodeConn).filter(k => /^\d+$/.test(k));
+      const allNumericKeys = Object.keys(nodeConn).filter(k => /^\d+$/.test(k));
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): leave out-of-range numeric keys unconverted
+      const numericKeys = allNumericKeys.filter(k => parseInt(k, 10) <= MAX_CONNECTION_INDEX);
+      if (numericKeys.length < allNumericKeys.length) {
+        logger.warn(`Skipped numeric connection key(s) above ${MAX_CONNECTION_INDEX} on node "${sourceName}"`);
+      }
 
       if (numericKeys.length === 0) continue;
 

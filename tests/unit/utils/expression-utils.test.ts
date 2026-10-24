@@ -151,6 +151,23 @@ describe('Expression Utilities', () => {
       it('should return false for array', () => {
         expect(containsExpression([])).toBe(false);
       });
+
+      it('should detect markers that share a brace', () => {
+        expect(containsExpression('{{}}')).toBe(true);
+        expect(containsExpression('{{}')).toBe(false);
+        expect(containsExpression('{{{}}')).toBe(true);
+        expect(containsExpression('}} {{')).toBe(false);
+      });
+    });
+
+    describe('Long input', () => {
+      it('handles a long run of braces', () => {
+        const start = performance.now();
+        expect(containsExpression('{'.repeat(130_000))).toBe(false);
+        expect(containsExpression('{'.repeat(130_000) + '}}')).toBe(true);
+        expect(containsExpression('{{a'.repeat(30_000))).toBe(false);
+        expect(performance.now() - start).toBeLessThan(2000);
+      });
     });
   });
 

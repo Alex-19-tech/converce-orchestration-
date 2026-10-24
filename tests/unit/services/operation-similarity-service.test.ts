@@ -2,7 +2,7 @@
  * Tests for OperationSimilarityService
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { OperationSimilarityService } from '../../../src/services/operation-similarity-service';
 import { NodeRepository } from '../../../src/database/node-repository';
 import { createTestDatabase } from '../../utils/database-utils';
@@ -229,6 +229,60 @@ describe('OperationSimilarityService', () => {
       );
 
       expect(suggestions).toBeDefined();
+    });
+  });
+
+  describe('input and cache bounds', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('handles a long operation value', () => {
+      const start = Date.now();
+      const results = Array.from({ length: 4 }, (_, i) =>
+        service.findSimilarOperations('nodes-base.googleDrive', 'z'.repeat(2_000_000) + i, 'file')
+      );
+      expect(Date.now() - start).toBeLessThan(2000);
+      expect(results.every(suggestions => suggestions.length === 0)).toBe(true);
+    });
+
+    it('returns no suggestions for values longer than any real name', () => {
+      const longOperation = 'download' + 'x'.repeat(200);
+      expect(service.findSimilarOperations('nodes-base.googleDrive', longOperation, 'file')).toEqual([]);
+      expect(service.findSimilarOperations('nodes-base.googleDrive', 'downlod', 'f'.repeat(10_000))).toEqual([]);
+    });
+
+    it('does not cache over-long resource or operation values', () => {
+      service.findSimilarOperations('nodes-base.googleDrive', 'downlod', 'r'.repeat(10_000));
+      service.findSimilarOperations('nodes-base.googleDrive', 'o'.repeat(10_000), 'file');
+
+      const keys = [
+        ...(service as any).operationCache.keys(),
+        ...(service as any).suggestionCache.keys(),
+      ];
+      expect(keys.every((key: string) => key.length <= 512)).toBe(true);
+    });
+
+    it('caps the number of cached entries', () => {
+      // Keep the probabilistic cleanup from running so only the size cap applies.
+      vi.spyOn(Math, 'random').mockReturnValue(0.99);
+
+      for (let i = 0; i < 700; i++) {
+        service.findSimilarOperations('nodes-base.googleDrive', `downlod${i}`, `resource${i}`);
+      }
+
+      expect((service as any).suggestionCache.size).toBeLessThanOrEqual(100);
+      expect((service as any).operationCache.size).toBeLessThanOrEqual(500);
+    });
+
+    it('keeps edit distances unchanged', () => {
+      const distance = (a: string, b: string) => (service as any).levenshteinDistance(a, b);
+      expect(distance('kitten', 'sitting')).toBe(3);
+      expect(distance('flaw', 'lawn')).toBe(2);
+      expect(distance('download', 'upload')).toBe(4);
+      expect(distance('', 'abc')).toBe(3);
+      expect(distance('abc', '')).toBe(3);
+      expect(distance('same', 'same')).toBe(0);
     });
   });
 });

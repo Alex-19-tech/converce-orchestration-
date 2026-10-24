@@ -1404,6 +1404,22 @@ describe('WorkflowValidator', () => {
       expect(result.warnings.some(w => w.code === 'group-contains-trigger')).toBe(true);
     });
 
+    it('handles a group member listed many times', async () => {
+      vi.mocked(mockNodeRepository.getNode).mockClear();
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: 't', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [0, 0], parameters: {}, typeVersion: 2 },
+          twoNodes[0],
+        ],
+        connections: { Webhook: { main: [[{ node: 'Set A', type: 'main', index: 0 }]] } },
+        nodeGroups: [{ id: 'g1', name: 'Everything', nodeIds: Array.from({ length: 2_000 }, () => 't') }],
+      } as any);
+
+      expect(vi.mocked(mockNodeRepository.getNode).mock.calls.length).toBeLessThan(50);
+      expect(result.warnings.filter(w => w.code === 'group-contains-trigger')).toHaveLength(1);
+      expect(result.warnings.filter(w => w.code === 'group-node-in-multiple-groups')).toHaveLength(1);
+    });
+
     it('says nothing about a healthy grouping', async () => {
       const result = await validator.validateWorkflow({
         nodes: twoNodes,

@@ -19,6 +19,7 @@ import {
   FormTriggerInput,
 } from '../types';
 import { BaseTriggerHandler } from './base-handler';
+import { describeSizeLimitError, getMaxResponseBytes } from '../../services/n8n-api-client';
 
 /**
  * Zod schema for form input validation
@@ -416,6 +417,9 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
         maxRedirects: 0,
         httpAgent: pinned?.httpAgent,
         httpsAgent: pinned?.httpsAgent,
+        // SECURITY (GHSA-xvxq-x6hr-xc2c): bound response size.
+        // No maxBodyLength: axios stalls on an empty multipart stream when it is set.
+        maxContentLength: getMaxResponseBytes(),
       };
 
       // Make the request
@@ -445,7 +449,8 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
 
       return result;
     } catch (error) {
-      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      let errorMessage = describeSizeLimitError(error)
+        ?? (error instanceof Error ? error.message : 'Unknown error');
       if (!errorMessage) {
         // An AggregateError from a multi-address connection failure
         // (autoSelectFamily across the pinned set) has an empty message;

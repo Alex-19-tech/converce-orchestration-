@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { EventEmitter } from 'events';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { MockedFunction } from 'vitest';
 
@@ -208,6 +209,44 @@ describe('HTTP Server Authentication', () => {
       mockExit.mockRestore();
     });
 
+    it('refuses to start in production with the default placeholder token', async () => {
+      process.env.AUTH_TOKEN = 'REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh';
+      process.env.NODE_ENV = 'production';
+
+      const mockExit = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('Process exited');
+      });
+
+      try {
+        await expect(startFixedHTTPServer()).rejects.toThrow('Process exited');
+        expect(mockExit).toHaveBeenCalledWith(1);
+        expect(mockExpressApp.listen).not.toHaveBeenCalled();
+      } finally {
+        mockExit.mockRestore();
+      }
+    });
+
+    it('starts with the default placeholder token outside production', async () => {
+      process.env.AUTH_TOKEN = 'REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh';
+      process.env.NODE_ENV = 'development';
+      vi.useFakeTimers();
+
+      const mockExit = vi.spyOn(process, 'exit').mockImplementation(() => {
+        throw new Error('Process exited');
+      });
+
+      try {
+        mockExpressApp.listen.mockReturnValue(mockServer);
+        await startFixedHTTPServer();
+        expect(mockExit).not.toHaveBeenCalled();
+        expect(mockExpressApp.listen).toHaveBeenCalled();
+      } finally {
+        mockExit.mockRestore();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    });
+
     it('should warn when token length is less than 32 characters', async () => {
       process.env.AUTH_TOKEN = 'short-token';
 
@@ -227,6 +266,98 @@ describe('HTTP Server Authentication', () => {
       expect(logger.warn).toHaveBeenCalledWith(
         'AUTH_TOKEN should be at least 32 characters for security'
       );
+    });
+  });
+
+  describe('POST /mcp body size', () => {
+    const token = 'body-size-test-token-with-more-than-32-characters';
+    const limit = 10 * 1024 * 1024;
+
+    async function getMcpHandler() {
+      process.env.AUTH_TOKEN = token;
+      process.env.NODE_ENV = 'development';
+      mockExpressApp.listen.mockReturnValue(mockServer);
+      await startFixedHTTPServer();
+      const call = mockExpressApp.post.mock.calls.find((c: any[]) => c[0] === '/mcp');
+      return call![1] as (req: any, res: any) => Promise<void>;
+    }
+
+    function makeReq(headers: Record<string, string>) {
+      const req: any = new EventEmitter();
+      req.headers = headers;
+      req.ip = '127.0.0.1';
+      req.get = (name: string) => headers[name.toLowerCase()];
+      req.pause = vi.fn();
+      req.destroy = vi.fn();
+      return req;
+    }
+
+    function makeRes() {
+      const res: any = new EventEmitter();
+      res.headersSent = false;
+      res.setHeader = vi.fn();
+      res.status = vi.fn(() => res);
+      res.json = vi.fn(() => {
+        res.headersSent = true;
+        res.emit('finish');
+        return res;
+      });
+      return res;
+    }
+
+    it('rejects a declared body above the limit with 413', async () => {
+      const handler = await getMcpHandler();
+      const req = makeReq({ authorization: `Bearer ${token}`, 'content-length': String(limit + 1) });
+      const res = makeRes();
+
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(413);
+      expect(req.listenerCount('data')).toBe(0);
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('stops reading a streamed body once it passes the limit', async () => {
+      const handler = await getMcpHandler();
+      const req = makeReq({ authorization: `Bearer ${token}` });
+      const res = makeRes();
+
+      await handler(req, res);
+      const chunk = Buffer.alloc(1024 * 1024, 0x20);
+      for (let i = 0; i < 12; i++) req.emit('data', chunk);
+      req.emit('end');
+
+      expect(res.status).toHaveBeenCalledTimes(1);
+      expect(res.status).toHaveBeenCalledWith(413);
+      expect(res.json).toHaveBeenCalledTimes(1);
+      expect(req.pause).toHaveBeenCalled();
+      expect(req.destroy).toHaveBeenCalled();
+    });
+
+    it('checks the token before reading the body', async () => {
+      const handler = await getMcpHandler();
+      const req = makeReq({ authorization: 'Bearer wrong-token', 'content-length': String(limit + 1) });
+      const res = makeRes();
+
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(req.listenerCount('data')).toBe(0);
+    });
+
+    it('handles a body under the limit', async () => {
+      const handler = await getMcpHandler();
+      const body = JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} });
+      const req = makeReq({ authorization: `Bearer ${token}`, 'content-length': String(Buffer.byteLength(body)) });
+      const res = makeRes();
+
+      await handler(req, res);
+      req.emit('data', Buffer.from(body));
+      req.emit('end');
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ id: 7, result: expect.anything() }));
     });
   });
 

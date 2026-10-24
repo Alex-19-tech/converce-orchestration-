@@ -215,6 +215,18 @@ describe('WorkflowVersioningService', () => {
       expect(result.backupCreated).toBe(false);
     });
 
+    it('should not restore a version that belongs to another workflow', async () => {
+      vi.spyOn(mockRepository, 'getWorkflowVersion').mockReturnValue({ ...createMockVersion(1), workflowId: 'workflow-2' });
+      const updateSpy = vi.spyOn(mockApiClient, 'updateWorkflow');
+
+      const result = await service.restoreVersion('workflow-1', 1, false);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Version 1 not found');
+      expect(result.backupCreated).toBe(false);
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
     it('should restore latest version when no versionId provided', async () => {
       const version = createMockVersion(3);
       vi.spyOn(mockRepository, 'getLatestWorkflowVersion').mockReturnValue(version);

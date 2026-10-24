@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.99.0] - 2026-10-24
+
+### Security
+
+- Fix denial of service in shared HTTP deployments through crafted tool input or n8n responses (GHSA-xvxq-x6hr-xc2c).
+- Fix credentials and personal data reaching telemetry and server logs (GHSA-rqgx-cvr7-hc6x).
+- The legacy HTTP server (`USE_FIXED_HTTP=true`) now refuses to start in production with the placeholder `AUTH_TOKEN` (GHSA-7mg3-m9wx-m555).
+- `n8n_workflow_versions` now checks that n8n accepts the API key before serving local backups (GHSA-74hp-7jv7-vx4j).
+
+### Changed
+
+- `n8n_update_partial_workflow`:
+  - Connection indexes (`sourceIndex`, `targetIndex`, `case`, `branch`, numeric `sourceOutput`, and `index` in `replaceConnections`) must be whole numbers from 0 to 1000.
+  - A request can hold at most 1000 operations.
+  - `patchNodeField` rejects regexes with a repeated group that itself contains `*`, `+` or `{n,}`. Use a simpler pattern or literal matching instead.
+  - `patchNodeField` regex matching has a time limit.
+  - The `patchNodeField` operations in one request can together grow fields by at most 512 KB beyond the replacement text they supply.
+  - Reserved keys are rejected in `updateSettings`.
+- Responses from n8n larger than 50 MB after decompression are rejected with `RESPONSE_TOO_LARGE`. Set `N8N_MCP_MAX_RESPONSE_SIZE` (bytes) to change the limit.
+- `POST /mcp` and `POST /messages` reject compressed request bodies with 415. MCP clients don't compress requests.
+- The legacy HTTP server rejects request bodies over 10 MB with 413, the same limit as the default server.
+- `Dockerfile.railway` no longer sets a placeholder `AUTH_TOKEN`. Set `AUTH_TOKEN` or `AUTH_TOKEN_FILE` in the service variables.
+- `n8n_workflow_versions` makes one n8n call per instance and API key, cached for 60 seconds, before it reads or deletes local backups. It returns `UNAUTHORIZED` when n8n rejects the key and `N8N_UNAVAILABLE` when n8n can't be reached. A key that can read a workflow but can't list workflows can still use the history of that workflow.
+- `validate_workflow` groups node-group warnings: after 5 of one kind in a group it reports one summary, and it stops at 50 node-group issues in total.
+- Resource and operation values longer than 128 characters get no similarity suggestions.
+- Telemetry redacts more values: short keys and signatures in name/value parameters, secrets inside JSON-string parameters, and personal data in node names. JSON-string parameters are parsed and written back, so compact JSON loses its spacing in telemetry.
+
 ## [2.98.1] - 2026-10-24
 
 ### Security

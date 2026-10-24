@@ -7,16 +7,50 @@ import { z } from 'zod';
 import { TelemetryEvent, WorkflowTelemetry } from './telemetry-types';
 import { logger } from '../utils/logger';
 
-// Base property schema that sanitizes strings
-const sanitizedString = z.string().transform(val => {
+// SECURITY (GHSA-xvxq-x6hr-xc2c): bound the email local part and the input size.
+const EMAIL_PATTERN = /[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const EMAIL_LOCAL_CHAR = /[a-zA-Z0-9._%+-]/;
+const MAX_STRING_LENGTH = 10_000;
+
+/** Replace emails; a local part longer than the bound is still removed whole. */
+function redactEmails(val: string): string {
+  let result = '';
+  let copied = 0;
+  for (const match of val.matchAll(EMAIL_PATTERN)) {
+    let start = match.index!;
+    while (start > copied && EMAIL_LOCAL_CHAR.test(val[start - 1])) start--;
+    result += `${val.substring(copied, start)}[EMAIL]`;
+    copied = match.index! + match[0].length;
+  }
+  return copied === 0 ? val : result + val.substring(copied);
+}
+
+/**
+ * Cut an over-long string at the last whitespace before the limit, so no
+ * token (URL, key, email) is split in two.
+ */
+function boundLength(val: string): string {
+  if (val.length <= MAX_STRING_LENGTH) {
+    return val;
+  }
+  let cut = MAX_STRING_LENGTH;
+  while (cut > 0 && !/\s/.test(val[cut])) cut--;
+  return `${val.substring(0, cut)} [TRUNCATED]`;
+}
+
+/** Sanitize a string property of a generic event. */
+export function sanitizeEventString(val: string): string {
   // Remove URLs
-  let sanitized = val.replace(/https?:\/\/[^\s]+/gi, '[URL]');
+  let sanitized = boundLength(val).replace(/https?:\/\/[^\s]+/gi, '[URL]');
   // Remove potential API keys
   sanitized = sanitized.replace(/[a-zA-Z0-9_-]{32,}/g, '[KEY]');
   // Remove emails
-  sanitized = sanitized.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[EMAIL]');
+  sanitized = redactEmails(sanitized);
   return sanitized;
-});
+}
+
+// Base property schema that sanitizes strings
+const sanitizedString = z.string().transform(sanitizeEventString);
 
 // Schema for generic event properties
 const eventPropertiesSchema = z.record(z.unknown()).transform(obj => {
@@ -107,13 +141,7 @@ const toolUsagePropertiesSchema = z.object({
 });
 
 const searchQueryPropertiesSchema = z.object({
-  query: z.string().max(100).transform(val => {
-    // Apply same sanitization as sanitizedString
-    let sanitized = val.replace(/https?:\/\/[^\s]+/gi, '[URL]');
-    sanitized = sanitized.replace(/[a-zA-Z0-9_-]{32,}/g, '[KEY]');
-    sanitized = sanitized.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[EMAIL]');
-    return sanitized;
-  }),
+  query: z.string().max(100).transform(sanitizeEventString),
   resultsFound: z.number().int().min(0),
   searchType: z.string().max(50),
   hasResults: z.boolean(),
@@ -221,8 +249,11 @@ function sanitizeNestedObject(obj: any, maxDepth: number): any {
   }
 
   if (Array.isArray(obj)) {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): string elements get the same sanitization as string values.
     return obj.slice(0, 10).map(item =>
-      typeof item === 'object' ? sanitizeNestedObject(item, maxDepth - 1) : item
+      typeof item === 'object'
+        ? sanitizeNestedObject(item, maxDepth - 1)
+        : typeof item === 'string' ? sanitizeEventString(item) : item
     );
   }
 

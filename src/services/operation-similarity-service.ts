@@ -21,6 +21,11 @@ export class OperationSimilarityService {
   private static readonly CACHE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
   private static readonly MIN_CONFIDENCE = 0.3; // 30% minimum confidence to suggest
   private static readonly MAX_SUGGESTIONS = 5;
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): bound input length and cache size
+  private static readonly MAX_NAME_LENGTH = 128;
+  private static readonly MAX_CACHE_KEY_LENGTH = 512;
+  private static readonly MAX_OPERATION_CACHE_ENTRIES = 500;
+  private static readonly MAX_SUGGESTION_CACHE_ENTRIES = 100;
 
   // Confidence thresholds for better code clarity
   private static readonly CONFIDENCE_THRESHOLDS = {
@@ -64,6 +69,21 @@ export class OperationSimilarityService {
         this.suggestionCache.set(key, value);
       });
     }
+  }
+
+  /**
+   * Insert into a cache, evicting the oldest entries once it is full.
+   * Keys longer than MAX_CACHE_KEY_LENGTH are not cached.
+   */
+  private static setBounded<V>(cache: Map<string, V>, key: string, value: V, maxEntries: number): void {
+    if (key.length > OperationSimilarityService.MAX_CACHE_KEY_LENGTH) return;
+    cache.delete(key);
+    while (cache.size >= maxEntries) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+    cache.set(key, value);
   }
 
   /**
@@ -142,6 +162,13 @@ export class OperationSimilarityService {
     resource?: string,
     maxSuggestions: number = OperationSimilarityService.MAX_SUGGESTIONS
   ): OperationSuggestion[] {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): no suggestions for values longer than any real name
+    const maxLength = OperationSimilarityService.MAX_NAME_LENGTH;
+    if ((typeof invalidOperation === 'string' && invalidOperation.length > maxLength) ||
+        (typeof resource === 'string' && resource.length > maxLength)) {
+      return [];
+    }
+
     // Clean up expired cache entries periodically
     if (Math.random() < 0.1) { // 10% chance to cleanup on each call
       this.cleanupExpiredEntries();
@@ -221,7 +248,9 @@ export class OperationSimilarityService {
     const topSuggestions = suggestions.slice(0, maxSuggestions);
 
     // Cache the result
-    this.suggestionCache.set(cacheKey, topSuggestions);
+    OperationSimilarityService.setBounded(
+      this.suggestionCache, cacheKey, topSuggestions, OperationSimilarityService.MAX_SUGGESTION_CACHE_ENTRIES
+    );
 
     return topSuggestions;
   }
@@ -331,7 +360,9 @@ export class OperationSimilarityService {
     }
 
     // Cache and return
-    this.operationCache.set(cacheKey, { operations, timestamp: Date.now() });
+    OperationSimilarityService.setBounded(
+      this.operationCache, cacheKey, { operations, timestamp: Date.now() }, OperationSimilarityService.MAX_OPERATION_CACHE_ENTRIES
+    );
     return operations;
   }
 
@@ -401,28 +432,33 @@ export class OperationSimilarityService {
    * Calculate Levenshtein distance between two strings
    */
   private levenshteinDistance(str1: string, str2: string): number {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): two-row distance, linear memory
     const m = str1.length;
     const n = str2.length;
-    const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+    if (m === 0) return n;
+    if (n === 0) return m;
 
-    for (let i = 0; i <= m; i++) dp[i][0] = i;
-    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    let prev: number[] = new Array(n + 1);
+    let curr: number[] = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
 
     for (let i = 1; i <= m; i++) {
+      curr[0] = i;
       for (let j = 1; j <= n; j++) {
         if (str1[i - 1] === str2[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1];
+          curr[j] = prev[j - 1];
         } else {
-          dp[i][j] = Math.min(
-            dp[i - 1][j] + 1,    // deletion
-            dp[i][j - 1] + 1,    // insertion
-            dp[i - 1][j - 1] + 1 // substitution
+          curr[j] = Math.min(
+            prev[j] + 1,     // deletion
+            curr[j - 1] + 1, // insertion
+            prev[j - 1] + 1  // substitution
           );
         }
       }
+      [prev, curr] = [curr, prev];
     }
 
-    return dp[m][n];
+    return prev[n];
   }
 
   /**
