@@ -1,9 +1,10 @@
 {
   "name": "n8n-mcp-runtime",
-  "version": "2.97.0",
+  "version": "2.98.0",
   "description": "n8n MCP Server Runtime Dependencies Only",
   "private": true,
   "dependencies": {
+    "acorn": "^8.16.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "express": "^5.1.0",
     "express-rate-limit": "^7.1.5",

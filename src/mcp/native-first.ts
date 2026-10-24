@@ -14,6 +14,9 @@ export const NODE_SELECTION_STEPS: readonly string[] = [
 export const CODE_IN_EXPRESSIONS_RULE =
   'An expression with a function body or several statements counts as code: use a Code node for it, not a long expression.';
 
+export const WHY_CODE_NOTE_RULE =
+  'When a Code node is the right choice, start its notes with "Why Code:" and the reason; validate_workflow then does not suggest a native node for it.';
+
 const NUMBERED_STEPS = NODE_SELECTION_STEPS.map((step, index) => `${index + 1}. ${step}`);
 
 export const SERVER_INSTRUCTIONS = [
@@ -21,6 +24,7 @@ export const SERVER_INSTRUCTIONS = [
   'Choose nodes native first, taking the first option that does the job:',
   ...NUMBERED_STEPS,
   CODE_IN_EXPRESSIONS_RULE,
+  WHY_CODE_NOTE_RULE,
   'Call get_node with detail "standard" before configuring a node: its options list many settings that make a Code node unnecessary.',
 ].join('\n');
 
@@ -31,5 +35,5 @@ Take the first option that does the job:
 ${NUMBERED_STEPS.join('\n')}
 
 ${CODE_IN_EXPRESSIONS_RULE}
-When a Code node is the right choice, read tools_documentation({topic: "javascript_code_node_guide"}) or tools_documentation({topic: "python_code_node_guide"}) first.`;
+${WHY_CODE_NOTE_RULE} Read tools_documentation({topic: "javascript_code_node_guide"}) or tools_documentation({topic: "python_code_node_guide"}) first.`;
 }
