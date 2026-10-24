@@ -399,8 +399,9 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
 
   if (methods.has('reduce')) {
     const calls = methods.get('reduce')!;
-    const totals = calls.length === 1 && isItems(calls[0].callee.object) && usedAsFieldValue(calls[0]) &&
-      isFieldTotal(calls[0]);
+    // The total must be the only list call: reduce plus map or find is more than Summarize does
+    const totals = calls.length === 1 && otherCalls(calls[0]).length === 0 && isItems(calls[0].callee.object) &&
+      usedAsFieldValue(calls[0]) && isFieldTotal(calls[0]);
     return totals ? result('summarize') : undefined;
   }
   if (['find', 'some', 'every', 'findIndex', 'flatMap'].some(method => methods.has(method))) return undefined;
