@@ -152,6 +152,7 @@ describe('findNativeAlternative', () => {
       ['outputs linked to a chosen input', `return items.map(item => ({ json: { id: item.json.id }, pairedItem: { item: 1 } }));`],
       ['a dedupe whose inner item shadows the outer one', `return items.filter((item, i, all) => all.findIndex(item => item.json.id === item.json.id) === i);`],
       ['a list sorted in place next to a filter', `const ignored = $input.first().json.tags.sort();\nreturn $input.all().filter(item => item.json.active);`],
+      ['several items per item, flattened', `return $input.all().map(item => [{ json: { id: item.json.id } }, { json: { id: item.json.id } }]).flat();`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],
       ['a multi-statement callback', `return $input.all().map(item => { const t = item.json.title; return { json: { t } }; });`],
     ])('%s', (_label, code) => {

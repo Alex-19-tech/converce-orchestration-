@@ -412,8 +412,9 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
 
     const param = callback.params[0]?.name;
     if (isItems(call.callee.object)) {
-      // items.map(item => ({ json: {...} })) maps fields, one item per item
-      if (returned) return buildsFields(mapped, resolve) ? result('editFields') : undefined;
+      // items.map(item => ({ json: {...} })) maps fields, one item per item; a callback
+      // that returns a list (item => [a, b]) makes several items per item
+      if (returned) return mapped.type === 'ObjectExpression' && buildsFields(mapped, resolve) ? result('editFields') : undefined;
       // items.map(...).join('\n') builds one text: Edit Fields run once
       if (isJoined(call, program)) return result('editFields', true);
       // One field of each item (item.json.id) or each item's data (item.json), collected
