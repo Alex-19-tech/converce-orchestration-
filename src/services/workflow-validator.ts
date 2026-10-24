@@ -280,12 +280,13 @@ function collectMalformedConnectionErrors(connections: Record<string, unknown>):
 }
 
 // Total connection steps the SplitInBatches loop-back checks may walk in one validation
-const MAX_LOOP_BACK_STEPS = 200_000;
+const MAX_LOOP_BACK_STEPS = 1_000_000;
 
 export class WorkflowValidator {
   private currentWorkflow: WorkflowJson | null = null;
-  private loopBackReach = new Map<string, Set<string>>();
+  private loopBackReach = new Map<string, { reached: Set<string>; complete: boolean }>();
   private loopBackSteps = 0;
+  private loopBackIncompleteReported = false;
   private lowerCaseNames = new Map<WorkflowNode, { type: string; name: string }>();
   private mainInputTargets: { workflow: WorkflowJson; targets: Set<string> } | null = null;
   private similarityService: NodeSimilarityService;
@@ -316,6 +317,7 @@ export class WorkflowValidator {
     this.currentWorkflow = workflow;
     this.loopBackReach = new Map();
     this.loopBackSteps = MAX_LOOP_BACK_STEPS;
+    this.loopBackIncompleteReported = false;
     this.lowerCaseNames = new Map();
     this.mainInputTargets = null;
 
@@ -674,6 +676,22 @@ export class WorkflowValidator {
     result: WorkflowValidationResult,
     profile: string
   ): Promise<void> {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): index of reported errors by node name and message
+    const reportedErrors = new Map<unknown, Set<unknown>>();
+    let reportedErrorsIndexed = 0;
+    const hasReportedError = (nodeName: string, message: string): boolean => {
+      for (; reportedErrorsIndexed < result.errors.length; reportedErrorsIndexed++) {
+        const e = result.errors[reportedErrorsIndexed];
+        let messages = reportedErrors.get(e.nodeName);
+        if (!messages) {
+          messages = new Set();
+          reportedErrors.set(e.nodeName, messages);
+        }
+        messages.add(e.message);
+      }
+      return reportedErrors.get(nodeName)?.has(message) ?? false;
+    };
+
     for (const node of workflow.nodes) {
       // Looked up once per node and reused below. The deprecation check runs before the
       // disabled skip: n8n checks disabled nodes too, and toggling one is an edit.
@@ -939,7 +957,7 @@ export class WorkflowValidator {
         // config validator already surfaced so nothing appears twice.
         if (node.type === 'n8n-nodes-base.if' || node.type === 'n8n-nodes-base.switch' || node.type === 'n8n-nodes-base.filter') {
           for (const err of validateConditionNodeStructure(node as any)) {
-            if (result.errors.some(e => e.nodeName === node.name && e.message === err)) continue;
+            if (hasReportedError(node.name, err)) continue;
             result.errors.push({
               type: 'error',
               nodeId: node.id,
@@ -1953,8 +1971,11 @@ export class WorkflowValidator {
    */
   private hasCycle(workflow: WorkflowJson): boolean {
     const visited = new Set<string>();
-    const recursionStack = new Set<string>();
+    // Position of each node on the current DFS path
+    const pathPosition = new Map<string, number>();
     const path: string[] = [];
+    // exitCounts[k]: potential cycle exits among path[0..k-1], filled on demand
+    const exitCounts: number[] = [0];
     const nodeTypeMap = new Map<string, string>();
     const nodeMap = new Map<string, WorkflowNode>();
 
@@ -2014,9 +2035,19 @@ export class WorkflowValidator {
       return outputCount !== null && outputCount > 1;
     };
 
+    // Whether any node on the current path from position `start` onwards is a potential exit
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): exit counts along the current path
+    const pathFromHasExit = (start: number): boolean => {
+      while (exitCounts.length <= path.length) {
+        const k = exitCounts.length - 1;
+        exitCounts.push(exitCounts[k] + (isPotentialCycleExit(path[k]) ? 1 : 0));
+      }
+      return exitCounts[path.length] > exitCounts[start];
+    };
+
     const hasCycleDFS = (nodeName: string): boolean => {
       visited.add(nodeName);
-      recursionStack.add(nodeName);
+      pathPosition.set(nodeName, path.length);
       path.push(nodeName);
 
       const connections = workflow.connections[nodeName];
@@ -2034,20 +2065,20 @@ export class WorkflowValidator {
         for (const target of allTargets) {
           if (!visited.has(target)) {
             if (hasCycleDFS(target)) return true;
-          } else if (recursionStack.has(target)) {
+          } else if (pathPosition.has(target)) {
             // Back edge found: the cycle is the current path segment from the
             // target onwards. Evaluate the exit condition over the WHOLE
             // cycle, not just the nodes on the first DFS path into it.
-            const cycleNodes = path.slice(path.indexOf(target));
-            if (!cycleNodes.some(isPotentialCycleExit)) {
+            if (!pathFromHasExit(pathPosition.get(target)!)) {
               return true; // No exit mechanism anywhere on the cycle
             }
           }
         }
       }
 
-      recursionStack.delete(nodeName);
+      pathPosition.delete(nodeName);
       path.pop();
+      if (exitCounts.length > path.length + 1) exitCounts.length = path.length + 1;
       return false;
     };
 
@@ -2270,6 +2301,8 @@ export class WorkflowValidator {
    * never under a top-level `error` connection key.
    */
   private workflowHasErrorHandling(workflow: WorkflowJson): boolean {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): whether a node name has any wired main output, per name
+    const hasWiredMainOutput = new Map<string, boolean>();
     return workflow.nodes.some(node => {
       if (node.disabled) return false;
       if (node.type.toLowerCase().includes('errortrigger')) return true;
@@ -2285,7 +2318,12 @@ export class WorkflowValidator {
       if (!Array.isArray(mainOutputs)) return false;
       const errorOutputIndex = this.getMainOutputCount(node);
       if (errorOutputIndex === null) {
-        return mainOutputs.some(conns => Array.isArray(conns) && conns.length > 0);
+        let wired = hasWiredMainOutput.get(node.name);
+        if (wired === undefined) {
+          wired = mainOutputs.some(conns => Array.isArray(conns) && conns.length > 0);
+          hasWiredMainOutput.set(node.name, wired);
+        }
+        return wired;
       }
       const errorConnections = mainOutputs[errorOutputIndex];
       return Array.isArray(errorConnections) && errorConnections.length > 0;
@@ -2851,7 +2889,9 @@ export class WorkflowValidator {
         // Check if this node connects back to the SplitInBatches
         const hasLoopBack = this.checkForLoopBack(targetNode.name, sourceNode.name, nodeMap);
         
-        if (hasLoopBack) {
+        if (hasLoopBack === null) {
+          this.reportIncompleteLoopBackCheck(result);
+        } else if (hasLoopBack) {
           result.errors.push({
             type: 'error',
             nodeId: sourceNode.id,
@@ -2892,7 +2932,9 @@ export class WorkflowValidator {
       
       // Check if loop output doesn't eventually connect back
       const hasLoopBack = this.checkForLoopBack(targetNode.name, sourceNode.name, nodeMap);
-      if (!hasLoopBack) {
+      if (hasLoopBack === null) {
+        this.reportIncompleteLoopBackCheck(result);
+      } else if (!hasLoopBack) {
         result.warnings.push({
           type: 'warning',
           nodeId: sourceNode.id,
@@ -2904,26 +2946,30 @@ export class WorkflowValidator {
   }
 
   /**
-   * Check if a node eventually connects back to a target node
+   * Check if a node eventually connects back to a target node.
+   * Returns null when the step budget ran out before the answer was known.
    */
   private checkForLoopBack(
     startNode: string,
     targetNode: string,
     nodeMap: Map<string, WorkflowNode>
-  ): boolean {
+  ): boolean | null {
     // SECURITY (GHSA-xvxq-x6hr-xc2c): reuse reachability per start node, with a step budget
-    let reached = this.loopBackReach.get(startNode);
-    if (!reached) {
-      reached = new Set<string>();
-      this.collectLoopBackReach(startNode, nodeMap, new Set(), 50, reached);
-      this.loopBackReach.set(startNode, reached);
+    let entry = this.loopBackReach.get(startNode);
+    if (!entry) {
+      const reached = new Set<string>();
+      const complete = this.collectLoopBackReach(startNode, nodeMap, new Set(), 50, reached);
+      entry = { reached, complete };
+      this.loopBackReach.set(startNode, entry);
     }
-    return reached.has(targetNode);
+    if (entry.reached.has(targetNode)) return true;
+    return entry.complete ? false : null;
   }
 
   /**
    * Collect every node name a depth-first walk from startNode reaches through
-   * connections, up to maxDepth levels.
+   * connections, up to maxDepth levels. Returns false if the step budget ran out,
+   * leaving `reached` holding the part of the walk done so far.
    */
   private collectLoopBackReach(
     startNode: string,
@@ -2931,31 +2977,46 @@ export class WorkflowValidator {
     visited: Set<string>,
     maxDepth: number,
     reached: Set<string>
-  ): void {
-    if (maxDepth <= 0) return; // Prevent stack overflow
-    if (visited.has(startNode)) return;
+  ): boolean {
+    if (maxDepth <= 0) return true; // Prevent stack overflow
+    if (visited.has(startNode)) return true;
     visited.add(startNode);
 
     const node = nodeMap.get(startNode);
-    if (!node) return;
+    if (!node) return true;
 
     const connections = this.currentWorkflow?.connections[startNode];
-    if (!connections) return;
+    if (!connections) return true;
+    if (this.loopBackSteps <= 0) return false;
 
     for (const outputs of Object.values(connections)) {
+      if (--this.loopBackSteps < 0) return false;
       if (!Array.isArray(outputs)) continue;
 
       for (const outputConnections of outputs) {
+        if (--this.loopBackSteps < 0) return false;
         if (!Array.isArray(outputConnections)) continue;
 
         for (const conn of outputConnections) {
-          if (this.loopBackSteps <= 0) return;
-          this.loopBackSteps--;
+          if (--this.loopBackSteps < 0) return false;
           reached.add(conn.node);
-          this.collectLoopBackReach(conn.node, nodeMap, visited, maxDepth - 1, reached);
+          if (!this.collectLoopBackReach(conn.node, nodeMap, visited, maxDepth - 1, reached)) return false;
         }
       }
     }
+    return true;
+  }
+
+  /**
+   * Add one workflow-level warning when a loop-back check could not be completed
+   */
+  private reportIncompleteLoopBackCheck(result: WorkflowValidationResult): void {
+    if (this.loopBackIncompleteReported) return;
+    this.loopBackIncompleteReported = true;
+    result.warnings.push({
+      type: 'warning',
+      message: 'The workflow\'s loop structure is too large to check fully. Some SplitInBatches loop-back checks were skipped.'
+    });
   }
 
   /**

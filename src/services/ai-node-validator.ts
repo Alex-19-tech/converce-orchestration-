@@ -131,6 +131,75 @@ export function getAIConnections(
 }
 
 /**
+ * Lookups shared by the AI node checks of one validation, each filled on first use
+ */
+export interface AIValidationLookups {
+  /** First node with this name, as workflow.nodes.find would return it */
+  nodeByName(name: string): WorkflowNode | undefined;
+  /** Incoming connection counts by connection type for a node name */
+  incomingCounts(nodeName: string): Map<string, number>;
+  /** Whether a node name has any outgoing main connection */
+  hasMainOutput(nodeName: string): boolean;
+  /** Whether the node receives main input from a streaming Chat Trigger */
+  isStreamingTarget(node: WorkflowNode): boolean;
+}
+
+function countIncomingByType(incoming: ReverseConnection[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const c of incoming) {
+    counts.set(c.type, (counts.get(c.type) ?? 0) + 1);
+  }
+  return counts;
+}
+
+export function createAIValidationLookups(
+  workflow: WorkflowJson,
+  reverseConnections: Map<string, ReverseConnection[]>
+): AIValidationLookups {
+  let nodesByName: Map<string, WorkflowNode> | undefined;
+  const incomingCounts = new Map<string, Map<string, number>>();
+  const mainOutputs = new Map<string, boolean>();
+  const streamingTargets = new Map<string, boolean>();
+  const lookups: AIValidationLookups = {
+    nodeByName(name) {
+      if (!nodesByName) {
+        nodesByName = new Map();
+        for (const n of workflow.nodes) {
+          if (!nodesByName.has(n.name)) nodesByName.set(n.name, n);
+        }
+      }
+      return nodesByName.get(name);
+    },
+    incomingCounts(nodeName) {
+      let counts = incomingCounts.get(nodeName);
+      if (!counts) {
+        counts = countIncomingByType(reverseConnections.get(nodeName) || []);
+        incomingCounts.set(nodeName, counts);
+      }
+      return counts;
+    },
+    hasMainOutput(nodeName) {
+      let has = mainOutputs.get(nodeName);
+      if (has === undefined) {
+        const main = workflow.connections[nodeName]?.main;
+        has = Boolean(main && main.flat().some((c: any) => c));
+        mainOutputs.set(nodeName, has);
+      }
+      return has;
+    },
+    isStreamingTarget(node) {
+      let streaming = streamingTargets.get(node.name);
+      if (streaming === undefined) {
+        streaming = checkIfStreamingTarget(node, reverseConnections, lookups);
+        streamingTargets.set(node.name, streaming);
+      }
+      return streaming;
+    }
+  };
+  return lookups;
+}
+
+/**
  * Validate AI Agent Node
  * From spec lines 3-549
  *
@@ -147,15 +216,17 @@ export function getAIConnections(
 export function validateAIAgent(
   node: WorkflowNode,
   reverseConnections: Map<string, ReverseConnection[]>,
-  workflow: WorkflowJson
+  workflow: WorkflowJson,
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): lookups shared across the nodes of one validation
+  lookups: AIValidationLookups = createAIValidationLookups(workflow, reverseConnections)
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const incoming = reverseConnections.get(node.name) || [];
+  const incomingCounts = lookups.incomingCounts(node.name);
 
   // 1. Validate language model connections (REQUIRED: 1 or 2 if fallback)
-  const languageModelConnections = incoming.filter(c => c.type === 'ai_languageModel');
+  const languageModelCount = incomingCounts.get('ai_languageModel') ?? 0;
 
-  if (languageModelConnections.length === 0) {
+  if (languageModelCount === 0) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
@@ -163,15 +234,15 @@ export function validateAIAgent(
       message: `AI Agent "${node.name}" requires an ai_languageModel connection. Connect a language model node (e.g., OpenAI Chat Model, Anthropic Chat Model).`,
       code: 'MISSING_LANGUAGE_MODEL'
     });
-  } else if (languageModelConnections.length > 2) {
+  } else if (languageModelCount > 2) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
       nodeName: node.name,
-      message: `AI Agent "${node.name}" has ${languageModelConnections.length} ai_languageModel connections. Maximum is 2 (for fallback model support).`,
+      message: `AI Agent "${node.name}" has ${languageModelCount} ai_languageModel connections. Maximum is 2 (for fallback model support).`,
       code: 'TOO_MANY_LANGUAGE_MODELS'
     });
-  } else if (languageModelConnections.length === 2) {
+  } else if (languageModelCount === 2) {
     // Check if fallback is enabled
     if (!node.parameters.needsFallback) {
       issues.push({
@@ -182,7 +253,7 @@ export function validateAIAgent(
         code: 'MULTIPLE_LANGUAGE_MODELS_NO_FALLBACK'
       });
     }
-  } else if (languageModelConnections.length === 1 && node.parameters.needsFallback === true) {
+  } else if (languageModelCount === 1 && node.parameters.needsFallback === true) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
@@ -193,10 +264,10 @@ export function validateAIAgent(
   }
 
   // 2. Validate output parser configuration
-  const outputParserConnections = incoming.filter(c => c.type === 'ai_outputParser');
+  const outputParserCount = incomingCounts.get('ai_outputParser') ?? 0;
 
   if (node.parameters.hasOutputParser === true) {
-    if (outputParserConnections.length === 0) {
+    if (outputParserCount === 0) {
       // n8n does not enforce this connection: the agent runs and returns a
       // plain string, silently skipping structured output
       issues.push({
@@ -207,7 +278,7 @@ export function validateAIAgent(
         code: 'MISSING_OUTPUT_PARSER'
       });
     }
-  } else if (outputParserConnections.length > 0) {
+  } else if (outputParserCount > 0) {
     issues.push({
       severity: 'warning',
       nodeId: node.id,
@@ -216,12 +287,12 @@ export function validateAIAgent(
     });
   }
 
-  if (outputParserConnections.length > 1) {
+  if (outputParserCount > 1) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
       nodeName: node.name,
-      message: `AI Agent "${node.name}" has ${outputParserConnections.length} output parsers. Only 1 is allowed.`,
+      message: `AI Agent "${node.name}" has ${outputParserCount} output parsers. Only 1 is allowed.`,
       code: 'MULTIPLE_OUTPUT_PARSERS'
     });
   }
@@ -267,13 +338,12 @@ export function validateAIAgent(
 
   // 5. Validate streaming mode constraints (CRITICAL)
   // From spec lines 753-879: AI Agent with streaming MUST NOT have main output connections
-  const isStreamingTarget = checkIfStreamingTarget(node, workflow, reverseConnections);
+  const isStreamingTarget = lookups.isStreamingTarget(node);
   const hasOwnStreamingEnabled = node.parameters?.options?.streamResponse === true;
 
   if (isStreamingTarget || hasOwnStreamingEnabled) {
     // Check if AI Agent has any main output connections
-    const agentMainOutput = workflow.connections[node.name]?.main;
-    if (agentMainOutput && agentMainOutput.flat().some((c: any) => c)) {
+    if (lookups.hasMainOutput(node.name)) {
       const streamSource = isStreamingTarget
         ? 'connected from Chat Trigger with responseMode="streaming"'
         : 'has streamResponse=true in options';
@@ -288,22 +358,22 @@ export function validateAIAgent(
   }
 
   // 6. Validate memory connections (0-1 allowed)
-  const memoryConnections = incoming.filter(c => c.type === 'ai_memory');
+  const memoryCount = incomingCounts.get('ai_memory') ?? 0;
 
-  if (memoryConnections.length > 1) {
+  if (memoryCount > 1) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
       nodeName: node.name,
-      message: `AI Agent "${node.name}" has ${memoryConnections.length} ai_memory connections. Only 1 memory is allowed.`,
+      message: `AI Agent "${node.name}" has ${memoryCount} ai_memory connections. Only 1 memory is allowed.`,
       code: 'MULTIPLE_MEMORY_CONNECTIONS'
     });
   }
 
   // 7. Validate tool connections
-  const toolConnections = incoming.filter(c => c.type === 'ai_tool');
+  const toolCount = incomingCounts.get('ai_tool') ?? 0;
 
-  if (toolConnections.length === 0) {
+  if (toolCount === 0) {
     issues.push({
       severity: 'info',
       nodeId: node.id,
@@ -349,8 +419,8 @@ export function validateAIAgent(
  */
 function checkIfStreamingTarget(
   node: WorkflowNode,
-  workflow: WorkflowJson,
-  reverseConnections: Map<string, ReverseConnection[]>
+  reverseConnections: Map<string, ReverseConnection[]>,
+  lookups: AIValidationLookups
 ): boolean {
   const incoming = reverseConnections.get(node.name) || [];
 
@@ -358,7 +428,7 @@ function checkIfStreamingTarget(
   const mainConnections = incoming.filter(c => c.type === 'main');
 
   for (const conn of mainConnections) {
-    const sourceNode = workflow.nodes.find(n => n.name === conn.sourceName);
+    const sourceNode = lookups.nodeByName(conn.sourceName);
     if (!sourceNode) continue;
 
     const normalizedType = NodeTypeNormalizer.normalizeToFullForm(sourceNode.type);
@@ -385,7 +455,9 @@ function checkIfStreamingTarget(
 export function validateChatTrigger(
   node: WorkflowNode,
   workflow: WorkflowJson,
-  reverseConnections: Map<string, ReverseConnection[]>
+  reverseConnections: Map<string, ReverseConnection[]>,
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): lookups shared across the nodes of one validation
+  lookups: AIValidationLookups = createAIValidationLookups(workflow, reverseConnections)
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -409,7 +481,7 @@ export function validateChatTrigger(
     return issues;
   }
 
-  const targetNode = workflow.nodes.find(n => n.name === firstConnection.node);
+  const targetNode = lookups.nodeByName(firstConnection.node);
   if (!targetNode) {
     issues.push({
       severity: 'error',
@@ -436,8 +508,7 @@ export function validateChatTrigger(
       });
     } else {
       // CRITICAL: Check AI Agent has NO main output connections
-      const agentMainOutput = workflow.connections[targetNode.name]?.main;
-      if (agentMainOutput && agentMainOutput.flat().some((c: any) => c)) {
+      if (lookups.hasMainOutput(targetNode.name)) {
         issues.push({
           severity: 'error',
           nodeId: targetNode.id,
@@ -477,15 +548,19 @@ export function validateChatTrigger(
  */
 export function validateBasicLLMChain(
   node: WorkflowNode,
-  reverseConnections: Map<string, ReverseConnection[]>
+  reverseConnections: Map<string, ReverseConnection[]>,
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): lookups shared across the nodes of one validation
+  lookups?: AIValidationLookups
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const incoming = reverseConnections.get(node.name) || [];
+  const incomingCounts = lookups
+    ? lookups.incomingCounts(node.name)
+    : countIncomingByType(reverseConnections.get(node.name) || []);
 
   // 1. Validate language model connections (REQUIRED: 1, or 2 with needsFallback)
-  const languageModelConnections = incoming.filter(c => c.type === 'ai_languageModel');
+  const languageModelCount = incomingCounts.get('ai_languageModel') ?? 0;
 
-  if (languageModelConnections.length === 0) {
+  if (languageModelCount === 0) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
@@ -493,15 +568,15 @@ export function validateBasicLLMChain(
       message: `Basic LLM Chain "${node.name}" requires an ai_languageModel connection. Connect a language model node.`,
       code: 'MISSING_LANGUAGE_MODEL'
     });
-  } else if (languageModelConnections.length > 2) {
+  } else if (languageModelCount > 2) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
       nodeName: node.name,
-      message: `Basic LLM Chain "${node.name}" has ${languageModelConnections.length} ai_languageModel connections. Maximum is 2 (for fallback model support).`,
+      message: `Basic LLM Chain "${node.name}" has ${languageModelCount} ai_languageModel connections. Maximum is 2 (for fallback model support).`,
       code: 'MULTIPLE_LANGUAGE_MODELS'
     });
-  } else if (languageModelConnections.length === 2 && !node.parameters.needsFallback) {
+  } else if (languageModelCount === 2 && !node.parameters.needsFallback) {
     // n8n uses only the first model when needsFallback is off - not fatal
     issues.push({
       severity: 'warning',
@@ -513,22 +588,22 @@ export function validateBasicLLMChain(
   }
 
   // 2. Validate memory connections (0-1 allowed)
-  const memoryConnections = incoming.filter(c => c.type === 'ai_memory');
+  const memoryCount = incomingCounts.get('ai_memory') ?? 0;
 
-  if (memoryConnections.length > 1) {
+  if (memoryCount > 1) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
       nodeName: node.name,
-      message: `Basic LLM Chain "${node.name}" has ${memoryConnections.length} ai_memory connections. Only 1 memory is allowed.`,
+      message: `Basic LLM Chain "${node.name}" has ${memoryCount} ai_memory connections. Only 1 memory is allowed.`,
       code: 'MULTIPLE_MEMORY_CONNECTIONS'
     });
   }
 
   // 3. Check for tool connections (not supported)
-  const toolConnections = incoming.filter(c => c.type === 'ai_tool');
+  const toolCount = incomingCounts.get('ai_tool') ?? 0;
 
-  if (toolConnections.length > 0) {
+  if (toolCount > 0) {
     issues.push({
       severity: 'error',
       nodeId: node.id,
@@ -566,6 +641,7 @@ export function validateAISpecificNodes(
 
   // Build reverse connection map (critical for AI validation)
   const reverseConnectionMap = buildReverseConnectionMap(workflow);
+  const lookups = createAIValidationLookups(workflow, reverseConnectionMap);
 
   for (const node of workflow.nodes) {
     if (node.disabled) continue;
@@ -574,19 +650,19 @@ export function validateAISpecificNodes(
 
     // Validate AI Agent nodes
     if (normalizedType === 'nodes-langchain.agent') {
-      const nodeIssues = validateAIAgent(node, reverseConnectionMap, workflow);
+      const nodeIssues = validateAIAgent(node, reverseConnectionMap, workflow, lookups);
       issues.push(...nodeIssues);
     }
 
     // Validate Chat Trigger nodes
     if (normalizedType === 'nodes-langchain.chatTrigger') {
-      const nodeIssues = validateChatTrigger(node, workflow, reverseConnectionMap);
+      const nodeIssues = validateChatTrigger(node, workflow, reverseConnectionMap, lookups);
       issues.push(...nodeIssues);
     }
 
     // Validate Basic LLM Chain nodes
     if (normalizedType === 'nodes-langchain.chainLlm') {
-      const nodeIssues = validateBasicLLMChain(node, reverseConnectionMap);
+      const nodeIssues = validateBasicLLMChain(node, reverseConnectionMap, lookups);
       issues.push(...nodeIssues);
     }
 
