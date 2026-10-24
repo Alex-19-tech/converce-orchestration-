@@ -315,7 +315,13 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     }
   });
 
-  if (disqualified || returns.length === 0) return undefined;
+  if (disqualified) return undefined;
+  // The node's own returns; a callback's return is its result (see callbackResult)
+  const callbacks = [...methods.values()].flat().map(call => call.arguments[0]).filter(Boolean);
+  const nodeReturns = returns.filter(ret => !callbacks.some(callback => contains(callback, ret)));
+  returns.length = 0;
+  returns.push(...nodeReturns);
+  if (returns.length === 0) return undefined;
   if (reusesComputedVariable(program, inits)) return undefined;
 
   /**
@@ -386,7 +392,7 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
   for (const call of callsOnItems('sort')) {
     const callback = call.arguments[0];
     if (otherCalls(call).length > 0) return undefined;
-    if (returnedAsItems(call) && callback?.params?.length === 2 && isSimpleCondition(callback)) return result('sort');
+    if (returnedAsItems(call) && isSortKeyComparator(callback)) return result('sort');
   }
   if (methods.has('sort') || methods.has('filter')) return undefined;
 
@@ -476,6 +482,44 @@ function isSimpleCondition(callback: AstNode): boolean {
     }
   });
   return simple;
+}
+
+/**
+ * A comparator that orders by one field, as the Sort node does:
+ * (a, b) => a.json.x - b.json.x, b.json.x - a.json.x, a.json.name.localeCompare(b.json.name),
+ * new Date(a.json.at) - new Date(b.json.at), Number(a.json.n) - Number(b.json.n).
+ */
+function isSortKeyComparator(callback: AstNode | undefined): boolean {
+  if (callback?.type !== 'ArrowFunctionExpression' || callback.params.length !== 2) return false;
+  const [a, b] = callback.params.map((param: AstNode) => param.name);
+  const body = callbackResult(callback);
+  if (!body) return false;
+  const sameKey = (left: AstNode, right: AstNode) => {
+    const l = sortKey(left);
+    const r = sortKey(right);
+    return l !== undefined && r !== undefined && l.wrap === r.wrap &&
+      JSON.stringify(l.segments) === JSON.stringify(r.segments) &&
+      ((l.root === a && r.root === b) || (l.root === b && r.root === a));
+  };
+  if (body.type === 'BinaryExpression' && body.operator === '-') return sameKey(body.left, body.right);
+  if (body.type === 'CallExpression' && propertyName(body.callee) === 'localeCompare' && body.arguments.length === 1) {
+    return sameKey(body.callee.object, body.arguments[0]);
+  }
+  return false;
+}
+
+/** a.json.x, new Date(a.json.x) or Number(a.json.x) -> the field read and its wrapper */
+function sortKey(node: AstNode): { root: string; segments: string[]; wrap: string } | undefined {
+  let wrap = '';
+  let inner = node;
+  if ((node.type === 'NewExpression' && isIdentifier(node.callee, 'Date')) ||
+      (node.type === 'CallExpression' && isIdentifier(node.callee, 'Number'))) {
+    if (node.arguments.length !== 1) return undefined;
+    wrap = node.callee.name;
+    inner = node.arguments[0];
+  }
+  const path = fieldPath(inner);
+  return path && path.segments.length > 0 ? { ...path, wrap } : undefined;
 }
 
 /**

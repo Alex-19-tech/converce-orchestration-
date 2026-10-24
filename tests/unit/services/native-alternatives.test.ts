@@ -47,9 +47,16 @@ describe('findNativeAlternative', () => {
       expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'splitOut', executeOnce: false });
     });
 
-    it('Sort for sorted items, numbers or strings', () => {
+    it('Sort for sorted items, numbers, strings or dates', () => {
       expect(kindOf(`return $input.all().sort((a, b) => b.json.score - a.json.score);`)).toBe('sort');
       expect(kindOf(`return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name));`)).toBe('sort');
+      expect(kindOf(`return $input.all().sort((a, b) => new Date(b.json.at) - new Date(a.json.at));`)).toBe('sort');
+    });
+
+    it('the same suggestions for block-bodied callbacks', () => {
+      expect(kindOf(`return $input.all().filter(item => { return item.json.active; });`)).toBe('filter');
+      expect(kindOf(`return $input.all().sort((a, b) => { return a.json.n - b.json.n; });`)).toBe('sort');
+      expect(kindOf(`const values = $input.all().map(item => { return item.json.id; });\nreturn [{ json: { values } }];`)).toBe('aggregate');
     });
 
     it('Edit Fields when the item data holds fields named json and pairedItem', () => {
@@ -152,6 +159,8 @@ describe('findNativeAlternative', () => {
       ['outputs linked to a chosen input', `return items.map(item => ({ json: { id: item.json.id }, pairedItem: { item: 1 } }));`],
       ['a dedupe whose inner item shadows the outer one', `return items.filter((item, i, all) => all.findIndex(item => item.json.id === item.json.id) === i);`],
       ['a list sorted in place next to a filter', `const ignored = $input.first().json.tags.sort();\nreturn $input.all().filter(item => item.json.active);`],
+      ['a pairwise precedence comparator', `return items.sort((a, b) => Number(b.json.before.includes(a.json.id)) - Number(a.json.before.includes(b.json.id)));`],
+      ['a comparator on different fields', `return items.sort((a, b) => a.json.x - b.json.y);`],
       ['several items per item, flattened', `return $input.all().map(item => [{ json: { id: item.json.id } }, { json: { id: item.json.id } }]).flat();`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],
       ['a multi-statement callback', `return $input.all().map(item => { const t = item.json.title; return { json: { t } }; });`],
