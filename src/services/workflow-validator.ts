@@ -1498,12 +1498,13 @@ export class WorkflowValidator {
     if ((parameters.language ?? 'javaScript') !== 'javaScript') return;
     if (typeof node.notes === 'string' && /^\s*why code:/i.test(node.notes)) return;
 
-    const alternative = findNativeAlternative(parameters.jsCode);
+    const alternative = findNativeAlternative(parameters.jsCode, parameters.mode);
     if (!alternative) return;
 
+    const runOnce = alternative.executeOnce ? ' with its "Execute Once" setting on' : '';
     const message = `Code node "${node.name}" only ${alternative.does}. The ${alternative.node} node ` +
-      `(${alternative.nodeType}) does this without code. If this needs a Code node, start its notes with ` +
-      `"Why Code:" and the reason.`;
+      `(${alternative.nodeType})${runOnce} does this without code. If this needs a Code node, start its ` +
+      `notes with "Why Code:" and the reason.`;
     if (this.isAdvisoryProfile(profile)) {
       result.warnings.push({ type: 'warning', nodeId: node.id, nodeName: node.name, message, code: 'NATIVE_ALTERNATIVE' });
     } else {
@@ -1536,11 +1537,18 @@ export class WorkflowValidator {
   }
 
   private actionNodesByCredential(): Map<string, string[]> | undefined {
-    const repository = this.nodeRepository as NodeRepository & { getActionNodesByCredentialType?: () => Map<string, string[]> };
+    const repository = this.nodeRepository;
+    // Repository stubs may not have this method
     if (typeof repository.getActionNodesByCredentialType !== 'function') return undefined;
     let map = ACTION_NODES_BY_CREDENTIAL.get(repository);
     if (!map) {
-      map = repository.getActionNodesByCredentialType();
+      try {
+        map = repository.getActionNodesByCredentialType();
+      } catch (error) {
+        // A hint must not turn into a node validation failure
+        logger.debug('Could not build the credential map for the HTTP Request hint', error);
+        map = new Map();
+      }
       ACTION_NODES_BY_CREDENTIAL.set(repository, map);
     }
     return map;

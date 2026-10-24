@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { findNativeAlternative, MAX_CODE_LINES } from '@/services/code-native-alternatives';
+import { findNativeAlternative, MAX_CODE_LINES, MAX_CODE_CHARS } from '@/services/code-native-alternatives';
 import { createDatabaseAdapter } from '@/database/database-adapter';
 import { NodeRepository } from '@/database/node-repository';
 import { WorkflowValidator } from '@/services/workflow-validator';
@@ -18,11 +18,23 @@ describe('findNativeAlternative', () => {
       ['a returned object of fields', `return { json: { name: $json.first + ' ' + $json.last, email: $json.email || null } };`],
       ['fields from other nodes', `return { id: $('Create').first().json.id, task: 'Ask for a budget' };`],
       ['items mapped to new fields', `return $input.all().map(item => ({ json: { title: item.json.metadata?.title, url: item.json.url } }));`],
-      ['a field set on the current item', `$input.item.json.fullName = $json.first + ' ' + $json.last;\nreturn $input.item;`],
       ['the current item spread with an extra field', `return { json: { ...$json, processedAt: new Date().toISOString() } };`],
       ['item texts joined into one message', `const lines = $input.all().map(item => item.json.title).join('\\n');\nreturn [{ json: { text: lines } }];`],
     ])('Edit Fields for %s', (_label, code) => {
       expect(kindOf(code)).toBe('editFields');
+    });
+
+    it('Edit Fields for a field set on the item in per-item mode', () => {
+      const code = `$input.item.json.fullName = $json.first + ' ' + $json.last;\nreturn $input.item;`;
+      expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'editFields', executeOnce: false });
+      // Run once for all items, $json and $input.item are the first item only
+      expect(findNativeAlternative(code, 'runOnceForAllItems')).toBeUndefined();
+    });
+
+    it('Edit Fields with Execute Once when one item is built from all items', () => {
+      const code = `return { json: { id: $('Create').first().json.id, task: 'Ask for a budget' } };`;
+      expect(findNativeAlternative(code)).toMatchObject({ kind: 'editFields', executeOnce: true });
+      expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'editFields', executeOnce: false });
     });
 
     it('Aggregate for a field collected from every item', () => {
@@ -41,9 +53,10 @@ describe('findNativeAlternative', () => {
       expect(kindOf(`return $input.all().filter(item => item.json.status === 'active');`)).toBe('filter');
     });
 
-    it('Remove Duplicates for a findIndex dedupe', () => {
+    it('Remove Duplicates for a findIndex or indexOf dedupe', () => {
       expect(kindOf(`return items.filter((item, index, all) => all.findIndex(other => other.json.id === item.json.id) === index);`))
         .toBe('removeDuplicates');
+      expect(kindOf(`return items.filter((item, i, all) => all.indexOf(item) === i);`)).toBe('removeDuplicates');
     });
 
     it('Summarize for a numeric total', () => {
@@ -51,9 +64,10 @@ describe('findNativeAlternative', () => {
         .toBe('summarize');
     });
 
-    it('HTTP Request for a single request', () => {
+    it('HTTP Request for a single request, run once in all-items mode', () => {
       const code = `const response = await this.helpers.httpRequest({ method: 'GET', url: 'https://api.example.com/items' });\nreturn [{ json: response }];`;
-      expect(findNativeAlternative(code)).toMatchObject({ kind: 'httpRequest', nodeType: 'n8n-nodes-base.httpRequest' });
+      expect(findNativeAlternative(code)).toMatchObject({ kind: 'httpRequest', nodeType: 'n8n-nodes-base.httpRequest', executeOnce: true });
+      expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'httpRequest', executeOnce: false });
     });
   });
 
@@ -87,6 +101,30 @@ describe('findNativeAlternative', () => {
       ['another node\'s items', `return $('Fetch').all().map(item => ({ json: { id: item.json.id } }));`],
       ['a ternary choosing between item lists', `return $json.ok ? [{ json: { ok: true } }] : [];`],
       ['a computed field name', `return { json: { [$json.key]: $json.value } };`],
+      ['a field set on one item', `$input.first().json.flag = true;\nreturn $input.all();`],
+      ['a field set on another item', `items[0].json.total = items.length;\nreturn items;`],
+      ['a global assignment', `globalThis.counter = 1;\nreturn { json: { a: 1 } };`],
+      ['an extra item appended', `return $input.all().concat([{ json: { total: $input.all().length } }]);`],
+      ['items made with Array', `return Array(3).fill({ json: { a: 1 } });`],
+      ['a fallback return value', `return $json.skip || [{ json: { a: $json.a } }];`],
+      ['an item dropped with null', `return $json.ok ? { json: { a: $json.a } } : null;`],
+      ['a filter that only looks like a dedupe', `return items.filter((item, i, all) => item.json.email.indexOf('@') !== -1);`],
+      ['an anti-join written inline', `return items.filter(item => !$('Sheet').all().some(row => row.json.id === item.json.id));`],
+      ['a filter against a local list', `return items.filter(item => ['a', 'b'].includes(item.json.kind));`],
+      ['a filter on $json', `return items.filter(item => item.json.id === $json.id);`],
+      ['a computed total', `const total = items.reduce((s, item) => s + item.json.price * item.json.qty, 0);\nreturn [{ json: { total } }];`],
+      ['a conditional total', `const total = items.reduce((s, item) => s + (item.json.paid ? item.json.amount : 0), 0);\nreturn [{ json: { total } }];`],
+      ['a total from a running balance', `const total = items.reduce((s, item) => s + item.json.amount, $('Prev').first().json.balance);\nreturn [{ json: { total } }];`],
+      ['a custom sort order', `return items.sort((a, b) => ['high', 'mid', 'low'].indexOf(a.json.p) - ['high', 'mid', 'low'].indexOf(b.json.p));`],
+      ['a maximum via apply', `const prices = items.map(item => item.json.price);\nreturn [{ json: { max: Math.max.apply(null, prices) } }];`],
+      ['the first mapped value', `return [{ json: { first: items.map(item => item.json.id)[0] } }];`],
+      ['a pass-through with pairedItem', `return [{ json: $input.first().json, pairedItem: { item: 0 } }];`],
+      ['items re-paired', `return items.map(item => ({ json: item.json, pairedItem: { item: 0 } }));`],
+      ['this.getNodeParameter', `return { json: { value: this.getNodeParameter('field', 0) } };`],
+      ['a getter', `return { json: { get now() { return Date.now(); } } };`],
+      ['a comma expression', `return { json: { a: ($json.x, $json.y) } };`],
+      ['a tagged template', `return { json: { text: String.raw\`a\\nb\` } };`],
+      ['a variable filled in later', `let x;\nreturn { json: { x } };`],
       ['a multi-statement callback', `return $input.all().map(item => { const t = item.json.title; return { json: { t } }; });`],
     ])('%s', (_label, code) => {
       expect(findNativeAlternative(code)).toBeUndefined();
@@ -95,6 +133,18 @@ describe('findNativeAlternative', () => {
     it(`code longer than ${MAX_CODE_LINES} lines`, () => {
       const fields = Array.from({ length: MAX_CODE_LINES + 2 }, (_, i) => `  f${i}: $json.f${i},`).join('\n');
       expect(findNativeAlternative(`return { json: {\n${fields}\n} };`)).toBeUndefined();
+    });
+
+    it('code hiding lines between comment markers in strings', () => {
+      const fields = Array.from({ length: 30 }, (_, i) => `  f${i}: $json.f${i},`).join('\n');
+      expect(findNativeAlternative(`const open = "/*";\nreturn { json: {\n${fields}\n  close: "*/" } };`)).toBeUndefined();
+    });
+
+    it(`more than ${MAX_CODE_CHARS} characters, in linear time`, () => {
+      expect(findNativeAlternative(`return { json: { text: '${'x'.repeat(MAX_CODE_CHARS)}' } };`)).toBeUndefined();
+      const started = Date.now();
+      findNativeAlternative('return { json: {} };\n' + '/* '.repeat(100_000));
+      expect(Date.now() - started).toBeLessThan(200);
     });
 
     it('non-string input', () => {
@@ -145,6 +195,7 @@ describe('WorkflowValidator native-alternative checks', () => {
       const warning = result.warnings.find(w => w.code === 'NATIVE_ALTERNATIVE');
       expect(warning?.nodeName, profile).toBe('Step');
       expect(warning?.message).toContain('Edit Fields (Set)');
+      expect(warning?.message).toContain('"Execute Once"');
       expect(warning?.message).toContain('"Why Code:"');
     }
   });
@@ -214,7 +265,7 @@ describe.skipIf(!fs.existsSync(sourceDbPath))('NodeRepository.getActionNodesByCr
       expect(map.get('notionApi')).toEqual(['Notion']);
       expect(map.get('slackApi')).toContain('Slack');
       // Triggers and tool variants are not action nodes
-      expect([...map.values()].flat().some(name => /Trigger$|Tool$/.test(name))).toBe(false);
+      expect([...map.values()].flat().some(name => /Trigger$|Tool$|: Insert$/.test(name))).toBe(false);
       // Model providers: their nodes wrap a small part of the API that HTTP Request calls
       for (const credential of ['openAiApi', 'googlePalmApi', 'mistralCloudApi', 'anthropicApi']) {
         expect(map.has(credential), credential).toBe(false);

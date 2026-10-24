@@ -5,8 +5,9 @@
  *
  * Precision matters more than recall: the result becomes a validation warning,
  * so anything that might need code returns undefined. Loops, branching,
- * parsing (regex, split, JSON.parse), state, libraries, error handling and
- * callbacks with more than one statement all count as needing code.
+ * parsing (regex, split, JSON.parse), state, libraries, error handling,
+ * callbacks with more than one statement, and returns that change the number
+ * of items in ways a node does not, all count as needing code.
  */
 
 import { parse } from 'acorn';
@@ -29,14 +30,22 @@ export interface NativeAlternative {
   nodeType: string;
   /** What the Code node does, completing "This Code node only ..." */
   does: string;
+  /**
+   * The node must run once rather than once per item ("Execute Once" in its
+   * settings): the Code node runs once for all items and produces one result.
+   */
+  executeOnce: boolean;
 }
 
-const ALTERNATIVES: Record<NativeAlternativeKind, Omit<NativeAlternative, 'kind'>> = {
+/** Code node execution mode (`parameters.mode`); n8n's default is runOnceForAllItems. */
+export type CodeNodeMode = 'runOnceForAllItems' | 'runOnceForEachItem';
+
+const ALTERNATIVES: Record<NativeAlternativeKind, Omit<NativeAlternative, 'kind' | 'executeOnce'>> = {
   editFields: { node: 'Edit Fields (Set)', nodeType: 'n8n-nodes-base.set', does: 'builds or renames fields' },
   filter: { node: 'Filter', nodeType: 'n8n-nodes-base.filter', does: 'filters items' },
   sort: { node: 'Sort', nodeType: 'n8n-nodes-base.sort', does: 'sorts items' },
   removeDuplicates: { node: 'Remove Duplicates', nodeType: 'n8n-nodes-base.removeDuplicates', does: 'removes duplicate items' },
-  summarize: { node: 'Summarize', nodeType: 'n8n-nodes-base.summarize', does: 'totals or counts items' },
+  summarize: { node: 'Summarize', nodeType: 'n8n-nodes-base.summarize', does: 'totals a field over the items' },
   aggregate: { node: 'Aggregate', nodeType: 'n8n-nodes-base.aggregate', does: 'collects item values into one list' },
   splitOut: { node: 'Split Out', nodeType: 'n8n-nodes-base.splitOut', does: 'turns a list field into separate items' },
   httpRequest: { node: 'HTTP Request', nodeType: 'n8n-nodes-base.httpRequest', does: 'makes an HTTP request' },
@@ -44,6 +53,8 @@ const ALTERNATIVES: Record<NativeAlternativeKind, Omit<NativeAlternative, 'kind'
 
 /** Longer bodies are left alone, whatever they contain. */
 export const MAX_CODE_LINES = 20;
+/** Checked before parsing, so the cost of a check stays bounded. */
+export const MAX_CODE_CHARS = 5000;
 
 /** Array methods whose callback may be a one-expression arrow function. */
 const CALLBACK_METHODS = new Set(['map', 'filter', 'sort', 'reduce', 'find', 'some', 'every', 'flatMap', 'findIndex']);
@@ -51,23 +62,32 @@ const CALLBACK_METHODS = new Set(['map', 'filter', 'sort', 'reduce', 'find', 'so
 /** Calls that mean parsing, side effects, state or anything a node field can't express. */
 const DISQUALIFYING_METHODS = new Set([
   'parse', 'match', 'matchAll', 'replace', 'replaceAll', 'split', 'test', 'exec',
-  'forEach', 'push', 'pop', 'shift', 'unshift', 'splice',
+  'forEach', 'push', 'pop', 'shift', 'unshift', 'splice', 'concat', 'fill',
+  'apply', 'call', 'bind',
   'log', 'info', 'warn', 'error', 'debug',
   'getWorkflowStaticData', 'evaluateExpression', 'then', 'catch'
 ]);
 const DISQUALIFYING_IDENTIFIERS = new Set([
   'require', 'Buffer', 'crypto', 'process', 'eval', 'Function', 'fetch', 'setTimeout', 'setInterval',
-  '$getWorkflowStaticData', '$evaluateExpression', 'Promise', 'RegExp'
+  '$getWorkflowStaticData', '$evaluateExpression', 'Promise', 'RegExp', 'Array', 'globalThis', 'arguments'
 ]);
 const DISQUALIFYING_NODE_TYPES = new Set([
   'ForStatement', 'ForInStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement',
   'TryStatement', 'ThrowStatement', 'SwitchStatement', 'IfStatement', 'LabeledStatement', 'WithStatement',
   'FunctionDeclaration', 'FunctionExpression', 'ClassDeclaration', 'ClassExpression', 'YieldExpression',
-  'UpdateExpression', 'ImportExpression'
+  'UpdateExpression', 'ImportExpression', 'SequenceExpression', 'TaggedTemplateExpression'
 ]);
-const ALLOWED_CONSTRUCTORS = new Set(['Date', 'Set']);
+/** `new Set()` (hand-made dedupe or lookups) is left to code. */
+const ALLOWED_CONSTRUCTORS = new Set(['Date']);
+/** Initializers that make a variable a computed intermediate (see reusesComputedVariable). */
+const COMPUTED_INITIALIZERS = new Set(['BinaryExpression', 'ConditionalExpression', 'LogicalExpression', 'CallExpression', 'NewExpression']);
 /** Globals a self-contained callback may use besides its own parameters and $-variables. */
-const CALLBACK_GLOBALS = new Set(['Date', 'Number', 'String', 'Boolean', 'Math', 'JSON', 'undefined', 'NaN', 'Infinity']);
+const CALLBACK_GLOBALS = new Set(['Date', 'Number', 'String', 'Boolean', 'Math', 'undefined', 'NaN', 'Infinity']);
+/** Calls a filter or sort condition may make; a node condition can express these. */
+const CONDITION_FUNCTIONS = new Set(['Number', 'String', 'Boolean']);
+const CONDITION_METHODS = new Set([
+  'toLowerCase', 'toUpperCase', 'trim', 'includes', 'startsWith', 'endsWith', 'localeCompare', 'getTime'
+]);
 
 type AstNode = { type: string; [key: string]: any };
 
@@ -83,16 +103,6 @@ function walk(node: AstNode, visit: (node: AstNode, parent: AstNode | undefined)
   }
 }
 
-function countCodeLines(code: string): number {
-  return code
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .filter(line => {
-      const trimmed = line.trim();
-      return trimmed !== '' && !trimmed.startsWith('//');
-    }).length;
-}
-
 function propertyName(member: AstNode): string | undefined {
   if (member.type !== 'MemberExpression') return undefined;
   if (!member.computed && member.property.type === 'Identifier') return member.property.name;
@@ -100,63 +110,92 @@ function propertyName(member: AstNode): string | undefined {
   return undefined;
 }
 
+function keyName(property: AstNode): string | undefined {
+  if (property.type !== 'Property') return undefined;
+  return property.key?.name ?? property.key?.value;
+}
+
+function isIdentifier(node: AstNode | undefined, name: string): boolean {
+  return node?.type === 'Identifier' && node.name === name;
+}
+
+/** a.b and { b: ... }: b is a property name, not a variable. */
+function isPropertyName(node: AstNode, parent: AstNode | undefined): boolean {
+  if (parent?.type === 'MemberExpression') return parent.property === node && !parent.computed;
+  if (parent?.type === 'Property') return parent.key === node && !parent.computed;
+  return false;
+}
+
+/** this.helpers or $helpers */
+function isHelpers(node: AstNode): boolean {
+  return propertyName(node) === 'helpers' || isIdentifier(node, '$helpers');
+}
+
 function isHttpRequestCall(node: AstNode): boolean {
-  if (node.type !== 'CallExpression' || propertyName(node.callee) !== 'httpRequest') return false;
-  const helpers = node.callee.object;
-  // this.helpers.httpRequest(...) or $helpers.httpRequest(...)
-  return (helpers.type === 'MemberExpression' && propertyName(helpers) === 'helpers') ||
-    (helpers.type === 'Identifier' && helpers.name === '$helpers');
+  return node.type === 'CallExpression' && propertyName(node.callee) === 'httpRequest' && isHelpers(node.callee.object);
+}
+
+/** The identifier at the root of a.b.c(...).d */
+function rootOf(node: AstNode | undefined): AstNode | undefined {
+  let base = node;
+  while (base && (base.type === 'MemberExpression' || base.type === 'CallExpression')) {
+    base = base.type === 'MemberExpression' ? base.object : base.callee;
+  }
+  return base;
 }
 
 /**
  * `$input.all()` or `items`: this node's input items. Another node's items
  * (`$('Node').all()`) are not: a native node after this one only sees its input.
  */
-function isItemsSource(node: AstNode | undefined, aliases: Set<string>): boolean {
-  if (!node) return false;
-  if (node.type === 'Identifier') return node.name === 'items' || aliases.has(node.name);
-  if (node.type === 'CallExpression' && propertyName(node.callee) === 'all') {
-    const owner = node.callee.object;
-    return owner.type === 'Identifier' && owner.name === '$input';
-  }
-  return false;
+function isItemsSource(node: AstNode | undefined): boolean {
+  if (isIdentifier(node, 'items')) return true;
+  return node?.type === 'CallExpression' && propertyName(node.callee) === 'all' && isIdentifier(node.callee.object, '$input');
+}
+
+/** The expression an arrow callback returns: its expression body or the argument of its one return. */
+function callbackResult(callback: AstNode): AstNode | undefined {
+  return callback.body.type === 'BlockStatement' ? callback.body.body[0]?.argument : callback.body;
 }
 
 /**
  * Return the native node that does the same job as this Code node, or undefined
  * when the code may need to be code.
  */
-export function findNativeAlternative(jsCode: unknown): NativeAlternative | undefined {
+export function findNativeAlternative(jsCode: unknown, mode: unknown = 'runOnceForAllItems'): NativeAlternative | undefined {
   // Advice only: an unexpected syntax tree must never break validation
   try {
-    return analyze(jsCode);
+    return analyze(jsCode, mode === 'runOnceForEachItem' ? 'runOnceForEachItem' : 'runOnceForAllItems');
   } catch {
     return undefined;
   }
 }
 
-function analyze(jsCode: unknown): NativeAlternative | undefined {
-  if (typeof jsCode !== 'string' || jsCode.trim() === '') return undefined;
-  if (countCodeLines(jsCode) > MAX_CODE_LINES) return undefined;
+function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undefined {
+  if (typeof jsCode !== 'string' || jsCode.trim() === '' || jsCode.length > MAX_CODE_CHARS) return undefined;
 
-  let program: AstNode;
-  try {
-    program = parse(jsCode, {
-      ecmaVersion: 'latest',
-      sourceType: 'script',
-      allowReturnOutsideFunction: true,
-      allowAwaitOutsideFunction: true
-    }) as unknown as AstNode;
-  } catch {
-    return undefined;
-  }
+  // Lines that hold code: comments are not tokens, a multi-line string counts every line.
+  // A syntax error throws and findNativeAlternative returns undefined.
+  const codeLines = new Set<number>();
+  const program = parse(jsCode, {
+    ecmaVersion: 'latest',
+    sourceType: 'script',
+    allowReturnOutsideFunction: true,
+    allowAwaitOutsideFunction: true,
+    locations: true,
+    onToken: (token) => {
+      if (token.type.label === 'eof' || !token.loc) return;
+      for (let line = token.loc.start.line; line <= token.loc.end.line; line++) codeLines.add(line);
+    }
+  }) as unknown as AstNode;
+  if (codeLines.size > MAX_CODE_LINES) return undefined;
 
+  const perItem = mode === 'runOnceForEachItem';
   let disqualified = false;
   const inits = new Map<string, AstNode>(); // variable -> its initializer
   const returns: AstNode[] = [];
   const methods = new Map<string, AstNode[]>(); // array method name -> call nodes
   let httpCalls = 0;
-  let usesSet = false;
   let assignsItemField = false;
 
   walk(program, (node, parent) => {
@@ -166,6 +205,10 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
     switch (node.type) {
       case 'Literal':
         if (node.regex) disqualified = true;
+        break;
+      case 'ThisExpression':
+        // this.helpers.httpRequest is checked below; this.getNodeParameter() and the like need code
+        if (!(parent?.type === 'MemberExpression' && propertyName(parent) === 'helpers')) disqualified = true;
         break;
       case 'UnaryExpression':
         if (node.operator === 'delete') disqualified = true;
@@ -179,8 +222,8 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
         }
         break;
       case 'Property':
-        // { [key]: value } builds a field name at runtime
-        if (node.computed && node.key.type !== 'Literal') disqualified = true;
+        // { [key]: value } builds a field name at runtime; getters and methods are code
+        if ((node.computed && node.key.type !== 'Literal') || node.kind !== 'init' || node.method) disqualified = true;
         break;
       case 'MemberExpression':
         // Binary data, and lookups by a computed key (table[$json.code]), need code
@@ -191,10 +234,6 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
         // Spreading the current item is "include other fields"; anything else has unknown keys
         if (!isCurrentItemJson(node.argument)) disqualified = true;
         break;
-      case 'ArrayExpression':
-        // Several items returned from one input: Edit Fields returns one item per input
-        if (parent?.type === 'ReturnStatement' && node.elements.length > 1) disqualified = true;
-        break;
       case 'Identifier':
         if (DISQUALIFYING_IDENTIFIERS.has(node.name)) disqualified = true;
         break;
@@ -203,16 +242,16 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
         break;
       case 'VariableDeclarator':
         if (node.id.type === 'Identifier' && node.init) inits.set(node.id.name, node.init);
-        else if (node.id.type !== 'Identifier') disqualified = true; // destructuring
+        else disqualified = true; // destructuring, or a variable filled in later
         break;
       case 'AssignmentExpression':
-        // Reassigning a variable is imperative code; setting a field on an item is not
-        if (node.left.type !== 'MemberExpression') disqualified = true;
-        else assignsItemField = true;
+        // Setting a field on the current item in per-item mode is what Edit Fields does;
+        // any other assignment (another item, a variable, a global) is code
+        if (perItem && node.operator === '=' && isCurrentItemField(node.left)) assignsItemField = true;
+        else disqualified = true;
         break;
       case 'NewExpression':
         if (node.callee.type !== 'Identifier' || !ALLOWED_CONSTRUCTORS.has(node.callee.name)) disqualified = true;
-        if (node.callee.type === 'Identifier' && node.callee.name === 'Set') usesSet = true;
         break;
       case 'AwaitExpression':
         if (!isHttpRequestCall(node.argument)) disqualified = true;
@@ -230,17 +269,14 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
         break;
       }
       case 'CallExpression': {
-        if (node.callee.type === 'Identifier' && DISQUALIFYING_IDENTIFIERS.has(node.callee.name)) { disqualified = true; break; }
+        // A plain call like require(...) is caught by the Identifier case
         const method = propertyName(node.callee);
         if (!method) break;
         if (isHttpRequestCall(node)) { httpCalls++; break; }
         if (DISQUALIFYING_METHODS.has(method)) { disqualified = true; break; }
+        // Object.keys/entries/assign (dynamic keys) and any other helper need code
         const object = node.callee.object;
-        // Object.keys/entries/assign...: dynamic keys need code
-        if (object.type === 'Identifier' && object.name === 'Object') { disqualified = true; break; }
-        // Any other helper (this.helpers.*, $helpers.*) needs code
-        if ((object.type === 'MemberExpression' && propertyName(object) === 'helpers') ||
-            (object.type === 'Identifier' && object.name === '$helpers')) { disqualified = true; break; }
+        if (isIdentifier(object, 'Object') || isHelpers(object)) { disqualified = true; break; }
         if (CALLBACK_METHODS.has(method)) methods.set(method, [...(methods.get(method) ?? []), node]);
         break;
       }
@@ -249,8 +285,6 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
 
   if (disqualified || returns.length === 0) return undefined;
   if (reusesComputedVariable(program, inits)) return undefined;
-
-  const pick = (kind: NativeAlternativeKind): NativeAlternative => ({ kind, ...ALTERNATIVES[kind] });
 
   /** Follow variables to their initializer and drop a trailing .slice() or .flat(). */
   const resolve = (node: AstNode | undefined, depth = 0): AstNode | undefined => {
@@ -261,37 +295,51 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
     }
     return node;
   };
-  const isItems = (node: AstNode | undefined) => {
-    const target = resolve(node);
-    return isItemsSource(target, new Set()) || (target?.type === 'Identifier' && target.name === 'items');
-  };
+  const isItems = (node: AstNode | undefined) => isItemsSource(resolve(node));
   /** The call's result is what the node returns as its items. */
   const returnedAsItems = (call: AstNode) => returns.some(ret => resolve(ret.argument) === call);
   const callsOnItems = (method: string) => (methods.get(method) ?? []).filter(call => isItems(call.callee.object));
+  const result = (kind: NativeAlternativeKind, executeOnce = false): NativeAlternative =>
+    ({ kind, ...ALTERNATIVES[kind], executeOnce });
+
+  // What a node can return: one object (one item), a list of one object, or the
+  // result of the array method that decides the suggestion. Anything else
+  // (x || [...], list.concat(...), a ternary with null) changes the item count.
+  const allCalls = new Set([...methods.values()].flat());
+  const returnShapesOk = returns.every(ret => {
+    const value = resolve(ret.argument);
+    if (!value) return false;
+    if (value.type === 'ObjectExpression') return true;
+    if (value.type === 'ArrayExpression') return value.elements.length === 1 && value.elements[0]?.type === 'ObjectExpression';
+    if (allCalls.has(value)) return true;
+    // per-item mode: return $input.item after setting its fields
+    return perItem && propertyName(value) === 'item' && isIdentifier(value.object, '$input');
+  });
+  if (!returnShapesOk) return undefined;
 
   if (httpCalls > 0) {
-    // One request and nothing else worth code
-    return httpCalls === 1 && methods.size === 0 && !usesSet ? pick('httpRequest') : undefined;
+    // One request and nothing else worth code; run once for all items, it is one request
+    return httpCalls === 1 && methods.size === 0 ? result('httpRequest', !perItem) : undefined;
   }
-  if (usesSet) return undefined;
 
   for (const call of callsOnItems('filter')) {
     const callback = call.arguments[0];
-    if (!returnedAsItems(call) || !isSelfContained(callback)) continue;
+    if (!returnedAsItems(call) || callback?.type !== 'ArrowFunctionExpression') continue;
     // filter((item, index, all) => all.findIndex(...) === index) removes duplicates
-    const dedupe = callback.params.length === 3 || containsCall(callback, ['indexOf', 'findIndex']);
-    return pick(dedupe ? 'removeDuplicates' : 'filter');
+    if (callback.params.length === 3) return isDedupeCallback(callback) ? result('removeDuplicates') : undefined;
+    return callback.params.length === 1 && isSimpleCondition(callback) ? result('filter') : undefined;
   }
   for (const call of callsOnItems('sort')) {
-    if (returnedAsItems(call) && isSelfContained(call.arguments[0])) return pick('sort');
+    const callback = call.arguments[0];
+    if (returnedAsItems(call) && callback?.params?.length === 2 && isSimpleCondition(callback)) return result('sort');
   }
   if (methods.has('sort') || methods.has('filter')) return undefined;
 
   if (methods.has('reduce')) {
     const calls = methods.get('reduce')!;
-    const totals = calls.length === 1 && isItems(calls[0].callee.object) && !returnedAsItems(calls[0]) &&
-      isNumericAccumulator(calls[0].arguments[0]);
-    return totals ? pick('summarize') : undefined;
+    const totals = calls.length === 1 && isItems(calls[0].callee.object) && usedAsFieldValue(calls[0]) &&
+      isFieldTotal(calls[0]);
+    return totals ? result('summarize') : undefined;
   }
   if (['find', 'some', 'every', 'findIndex', 'flatMap'].some(method => methods.has(method))) return undefined;
 
@@ -300,86 +348,127 @@ function analyze(jsCode: unknown): NativeAlternative | undefined {
     if (calls.length !== 1) return undefined;
     const call = calls[0];
     const callback = call.arguments[0];
-    if (!callback || callback.type !== 'ArrowFunctionExpression') return undefined;
-    const result = callback.body.type === 'BlockStatement' ? callback.body.body[0]?.argument : callback.body;
-    if (!result) return undefined;
-    const returnsObject = result.type === 'ObjectExpression';
-    const returned = returnedAsItems(call);
-
+    if (callback?.type !== 'ArrowFunctionExpression') return undefined;
     // An index parameter (item, i) => ... numbers or pairs items: leave it to code
     if (callback.params.length > 1) return undefined;
+    const mapped = callbackResult(callback);
+    if (!mapped) return undefined;
+    const returned = returnedAsItems(call);
+
     if (isItems(call.callee.object)) {
-      // items.map(item => ({ json: {...} })) maps fields
-      if (returned) return returnsObject ? pick('editFields') : undefined;
-      // items.map(...).join('\n') builds one text: Edit Fields with Execute Once
-      if (isJoined(call, program)) return pick('editFields');
-      // collected into one item it aggregates
-      return pick('aggregate');
+      // items.map(item => ({ json: {...} })) maps fields, one item per item
+      if (returned) return buildsFields(mapped, resolve) ? result('editFields') : undefined;
+      // items.map(...).join('\n') builds one text: Edit Fields run once
+      if (isJoined(call, program)) return result('editFields', true);
+      // collected into a field of one item it aggregates
+      return usedAsFieldValue(call) ? result('aggregate') : undefined;
     }
     // A list field turned into items: $json.rows.map(row => ({ json: row }))
-    return returnsObject && returned && isInputField(resolve(call.callee.object)) ? pick('splitOut') : undefined;
+    return mapped.type === 'ObjectExpression' && returned && isInputField(resolve(call.callee.object))
+      ? result('splitOut')
+      : undefined;
   }
 
-  // No array methods: building fields from the input
-  const buildsObject = returns.some(ret => buildsFields(resolve(ret.argument)));
-  return buildsObject || assignsItemField ? pick('editFields') : undefined;
-}
+  // No array methods: building fields from the input. Run once for all items, the
+  // Code node returns one item, so Edit Fields has to run once too.
+  const buildsObject = returns.some(ret => buildsFields(resolve(ret.argument), resolve));
+  return buildsObject || assignsItemField ? result('editFields', !perItem) : undefined;
 
-/** A callback that uses only its parameters, $-variables and plain globals. */
-function isSelfContained(callback: AstNode | undefined): boolean {
-  if (!callback || callback.type !== 'ArrowFunctionExpression') return false;
-  // Parameters of the callback and of callbacks nested in it
-  const params = new Set<string>();
-  walk(callback, (node) => {
-    if (node.type === 'ArrowFunctionExpression') for (const param of node.params) params.add(param.name);
-  });
-  let selfContained = true;
-  walk(callback.body, (node, parent) => {
-    if (node.type !== 'Identifier') return;
-    // property names in a.b and { b: ... } are not variables
-    if (parent?.type === 'MemberExpression' && parent.property === node && !parent.computed) return;
-    if (parent?.type === 'Property' && parent.key === node && !parent.computed) return;
-    if (params.has(node.name) || node.name.startsWith('$') || CALLBACK_GLOBALS.has(node.name)) return;
-    selfContained = false;
-  });
-  return selfContained;
-}
-
-/** (sum, item) => sum + item.json.amount */
-function isNumericAccumulator(callback: AstNode | undefined): boolean {
-  if (!callback || callback.type !== 'ArrowFunctionExpression' || callback.params.length < 2) return false;
-  const body = callback.body.type === 'BlockStatement' ? callback.body.body[0]?.argument : callback.body;
-  const accumulator = callback.params[0].name;
-  return body?.type === 'BinaryExpression' && body.operator === '+' &&
-    body.left.type === 'Identifier' && body.left.name === accumulator && isSelfContained(callback);
-}
-
-function containsCall(node: AstNode, methodNames: string[]): boolean {
-  let found = false;
-  walk(node, (child) => {
-    if (child.type === 'CallExpression' && methodNames.includes(propertyName(child.callee) ?? '')) found = true;
-  });
-  return found;
+  /** The call's result is the value of a field in what the node returns. */
+  function usedAsFieldValue(call: AstNode): boolean {
+    let used = false;
+    for (const ret of returns) {
+      const value = resolve(ret.argument);
+      if (!value) continue;
+      walk(value, (node) => {
+        if (node.type === 'Property' && resolve(node.value) === call) used = true;
+      });
+    }
+    return used;
+  }
 }
 
 /**
- * Whether the returned value builds fields: an object literal other than a bare
- * `{ json: <existing value> }` wrapper, which only passes an item through.
+ * A filter or sort callback that reads only the item(s) it is given, with
+ * operators and a few string, number and date calls: what a node condition or
+ * sort key expresses. Reading another node or list ($('Sheet').all(), a local
+ * array) does not count.
  */
-function buildsFields(node: AstNode | undefined): boolean {
-  if (!node) return false;
-  let found = false;
-  walk(node, (child) => {
-    if (child.type !== 'ObjectExpression') return;
-    const wrapperOnly = child.properties.length > 0 && child.properties.every((property: AstNode) => {
-      if (property.type !== 'Property') return false;
-      const key = property.key?.name ?? property.key?.value;
-      if (key === 'pairedItem') return true;
-      return key === 'json' && property.value.type !== 'ObjectExpression';
-    });
-    if (!wrapperOnly) found = true;
+function isSimpleCondition(callback: AstNode): boolean {
+  const params = new Set(callback.params.map((param: AstNode) => param.name));
+  let simple = true;
+  walk(callback.body, (node, parent) => {
+    if (!simple) return;
+    if (node.type === 'Identifier' && !isPropertyName(node, parent)) {
+      // $json here would be the first input item, not the one being tested
+      if (!params.has(node.name) && !CALLBACK_GLOBALS.has(node.name)) simple = false;
+    }
+    if (node.type === 'ArrowFunctionExpression' || node.type === 'ArrayExpression' || node.type === 'ObjectExpression') simple = false;
+    if (node.type === 'CallExpression') {
+      const callee = node.callee;
+      if (callee.type === 'Identifier') {
+        if (!CONDITION_FUNCTIONS.has(callee.name)) simple = false;
+      } else if (propertyName(callee) === 'now' && isIdentifier(callee.object, 'Date')) {
+        // Date.now()
+      } else if (!CONDITION_METHODS.has(propertyName(callee) ?? '') || !params.has(rootOf(callee)?.name)) {
+        simple = false;
+      }
+    }
   });
-  return found;
+  return simple;
+}
+
+/** (item, index, all) => all.findIndex(other => ...) === index, or all.indexOf(item) === index */
+function isDedupeCallback(callback: AstNode): boolean {
+  const [item, index, all] = callback.params.map((param: AstNode) => param.name);
+  const body = callbackResult(callback);
+  if (body?.type !== 'BinaryExpression' || !['===', '=='].includes(body.operator)) return false;
+  const sides = [body.left, body.right];
+  const indexSide = sides.find(side => isIdentifier(side, index));
+  const lookup = sides.find(side => side !== indexSide);
+  if (!indexSide || lookup?.type !== 'CallExpression' || !isIdentifier(lookup.callee.object, all)) return false;
+  const method = propertyName(lookup.callee);
+  if (method === 'indexOf') return isIdentifier(lookup.arguments[0], item);
+  if (method !== 'findIndex') return false;
+  // The inner predicate compares fields of the two items and nothing else
+  const inner = lookup.arguments[0];
+  if (inner?.type !== 'ArrowFunctionExpression' || inner.params.length !== 1) return false;
+  let ok = true;
+  walk(inner.body, (node, parent) => {
+    if (node.type === 'CallExpression' || node.type === 'ArrowFunctionExpression') ok = false;
+    if (node.type === 'Identifier' && !isPropertyName(node, parent) && node.name !== item && node.name !== inner.params[0].name) ok = false;
+  });
+  return ok;
+}
+
+/** items.reduce((sum, item) => sum + item.json.amount, 0): a field totalled from 0 */
+function isFieldTotal(call: AstNode): boolean {
+  const [callback, initial] = call.arguments;
+  if (callback?.type !== 'ArrowFunctionExpression' || callback.params.length !== 2) return false;
+  if (initial?.type !== 'Literal' || (initial.value !== 0 && initial.value !== '')) return false;
+  const body = callbackResult(callback);
+  if (body?.type !== 'BinaryExpression' || body.operator !== '+' || !isIdentifier(body.left, callback.params[0].name)) return false;
+  // The added value is a plain field of the item: item.json.amount
+  let field = body.right;
+  if (field.type !== 'MemberExpression') return false;
+  while (field.type === 'MemberExpression' && !field.computed) field = field.object;
+  return isIdentifier(field, callback.params[1].name);
+}
+
+/**
+ * Whether a returned value builds fields: an object literal other than a bare
+ * `{ json: <existing value> }` wrapper or a lone spread, which only pass an item
+ * through. `pairedItem` is item linking, not a field.
+ */
+function buildsFields(node: AstNode | undefined, resolve: (node: AstNode | undefined) => AstNode | undefined): boolean {
+  if (!node) return false;
+  if (node.type === 'ArrayExpression') return node.elements.some((element: AstNode) => buildsFields(element, resolve));
+  if (node.type !== 'ObjectExpression') return false;
+  const properties = node.properties.filter((property: AstNode) => keyName(property) !== 'pairedItem');
+  if (properties.length === 0) return false;
+  if (properties.every((property: AstNode) => property.type === 'SpreadElement')) return false;
+  if (properties.length === 1 && keyName(properties[0]) === 'json') return buildsFields(resolve(properties[0].value), resolve);
+  return true;
 }
 
 /** $json, item.json, $input.item.json or $input.first().json: the current input item. */
@@ -388,9 +477,22 @@ function isCurrentItemJson(node: AstNode): boolean {
   if (propertyName(node) !== 'json') return false;
   const owner = node.object;
   if (owner.type === 'Identifier') return true; // a callback parameter or an item variable
-  if (propertyName(owner) === 'item' && owner.object.type === 'Identifier' && owner.object.name === '$input') return true;
-  return owner.type === 'CallExpression' && propertyName(owner.callee) === 'first' &&
-    owner.callee.object.type === 'Identifier' && owner.callee.object.name === '$input';
+  if (propertyName(owner) === 'item' && isIdentifier(owner.object, '$input')) return true;
+  return owner.type === 'CallExpression' && propertyName(owner.callee) === 'first' && isIdentifier(owner.callee.object, '$input');
+}
+
+/** $json.field or $input.item.json.field (also nested): a field of the item a per-item run handles. */
+function isCurrentItemField(node: AstNode): boolean {
+  if (node.type !== 'MemberExpression') return false;
+  let owner: AstNode = node.object;
+  while (owner.type === 'MemberExpression' && !(propertyName(owner) === 'json' && isInputItem(owner.object))) {
+    owner = owner.object;
+  }
+  return isIdentifier(owner, '$json') || (propertyName(owner) === 'json' && isInputItem(owner.object));
+}
+
+function isInputItem(node: AstNode): boolean {
+  return propertyName(node) === 'item' && isIdentifier(node.object, '$input');
 }
 
 /** list[list.length - 1] and similar: an index computed from a length or a number. */
@@ -415,20 +517,15 @@ function isJoined(call: AstNode, program: AstNode): boolean {
  * than once: each use would repeat the computation in a node field.
  */
 function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): boolean {
-  const computed = new Set(
-    [...inits].filter(([, init]) => ['BinaryExpression', 'ConditionalExpression', 'LogicalExpression', 'CallExpression', 'NewExpression']
-      .includes(init.type)).map(([name]) => name)
-  );
+  const computed = new Set<string>();
+  for (const [name, init] of inits) if (COMPUTED_INITIALIZERS.has(init.type)) computed.add(name);
   if (computed.size === 0) return false;
   const uses = new Map<string, number>();
-  const counted = new WeakSet<AstNode>(); // in case key and value share a node
   walk(program, (node, parent) => {
-    if (node.type !== 'Identifier' || !computed.has(node.name) || counted.has(node)) return;
-    counted.add(node);
+    if (node.type !== 'Identifier' || !computed.has(node.name)) return;
     if (parent?.type === 'VariableDeclarator' && parent.id === node) return;
-    if (parent?.type === 'MemberExpression' && parent.property === node && !parent.computed) return;
-    // a property key is not a use; in a shorthand { total } the value node is
-    if (parent?.type === 'Property' && parent.key === node && !parent.computed && parent.value !== node) return;
+    // A shorthand { total } still counts: acorn gives its value a node of its own
+    if (isPropertyName(node, parent)) return;
     uses.set(node.name, (uses.get(node.name) ?? 0) + 1);
   });
   return [...uses.values()].some(count => count > 1);
@@ -441,9 +538,6 @@ function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): 
  */
 function isInputField(node: AstNode | undefined): boolean {
   if (node?.type !== 'MemberExpression') return false;
-  let base: AstNode = node;
-  while (base.type === 'MemberExpression' || base.type === 'CallExpression') {
-    base = base.type === 'MemberExpression' ? base.object : base.callee;
-  }
-  return base.type === 'Identifier' && ['$json', '$input', 'items'].includes(base.name);
+  const base = rootOf(node);
+  return base?.type === 'Identifier' && ['$json', '$input', 'items'].includes(base.name);
 }

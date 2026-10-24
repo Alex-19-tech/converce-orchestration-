@@ -310,32 +310,36 @@ export class NodeRepository {
    * nodes cover a small part of the provider's API.
    */
   getActionNodesByCredentialType(): Map<string, string[]> {
+    type Row = { node_type: string; display_name: string; credentials_required: string | null; outputs: string | null };
     const rows = this.db.prepare(`
       SELECT node_type, display_name, credentials_required, outputs
       FROM nodes
       WHERE is_community = 0 AND is_trigger = 0 AND is_tool_variant = 0
-    `).all() as Array<{ node_type: string; display_name: string; credentials_required: string | null; outputs: string | null }>;
+    `).all() as Row[];
+
+    const credentialNames = (row: Row): string[] => {
+      const credentials = this.safeJsonParse(row.credentials_required ?? '', []);
+      if (!Array.isArray(credentials)) return [];
+      return credentials.map(credential => credential?.name).filter((name): name is string => typeof name === 'string');
+    };
 
     const modelProviderCredentials = new Set<string>();
     for (const row of rows) {
       if (!/ai_languageModel|ai_embedding/.test(row.outputs ?? '')) continue;
-      for (const credential of this.safeJsonParse(row.credentials_required ?? '', [])) {
-        if (typeof credential?.name === 'string') modelProviderCredentials.add(credential.name);
-      }
+      for (const credential of credentialNames(row)) modelProviderCredentials.add(credential);
     }
 
     const byCredential = new Map<string, string[]>();
     for (const row of rows) {
-      if (row.node_type === 'nodes-base.httpRequest') continue;
+      // HTTP Request itself, and the legacy vector-store insert nodes (Pinecone: Insert, ...)
+      if (row.node_type === 'nodes-base.httpRequest' || row.node_type.startsWith('nodes-langchain.vectorStore')) continue;
       const outputs = this.safeJsonParse(row.outputs ?? '', null);
       if (!Array.isArray(outputs) || outputs.length !== 1 || outputs[0] !== 'main') continue;
-      const credentials = this.safeJsonParse(row.credentials_required ?? '', []);
-      if (!Array.isArray(credentials)) continue;
-      for (const credential of credentials) {
-        if (typeof credential?.name !== 'string' || modelProviderCredentials.has(credential.name)) continue;
-        const names = byCredential.get(credential.name) ?? [];
-        if (!names.includes(row.display_name)) names.push(row.display_name);
-        byCredential.set(credential.name, names);
+      for (const credential of credentialNames(row)) {
+        if (modelProviderCredentials.has(credential)) continue;
+        const nodeNames = byCredential.get(credential) ?? [];
+        if (!nodeNames.includes(row.display_name)) nodeNames.push(row.display_name);
+        byCredential.set(credential, nodeNames);
       }
     }
     return byCredential;
