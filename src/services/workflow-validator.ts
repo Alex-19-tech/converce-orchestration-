@@ -1929,12 +1929,12 @@ export class WorkflowValidator {
     }
 
     // BFS from all trigger nodes
-    const reachable = new Set<string>();
-    const queue: string[] = [...triggerNodes];
-    for (const t of triggerNodes) reachable.add(t);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): each name is queued once and read by index
+    const reachable = new Set<string>(triggerNodes);
+    const queue: string[] = [...reachable];
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    for (let head = 0; head < queue.length; head++) {
+      const current = queue[head];
       const neighbors = adjacency.get(current);
       if (neighbors) {
         for (const neighbor of neighbors) {

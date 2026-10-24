@@ -20,6 +20,22 @@ describe('WorkflowValidator - large workflows', () => {
     validator = new WorkflowValidator(mockNodeRepository, mockNodeValidator);
   });
 
+  describe('trigger reachability', () => {
+    it('handles many triggers with the same name feeding many nodes', async () => {
+      const count = 20_000;
+      const nodes: any[] = Array.from({ length: count }, () => node('Trigger', 'n8n-nodes-base.manualTrigger'));
+      for (let k = 0; k < count; k++) nodes.push(node(`Step ${k}`, 'n8n-nodes-base.noOp'));
+      nodes.push(node('Detached', 'n8n-nodes-base.noOp'));
+      const connections: any = { Trigger: { main: [Array.from({ length: count }, (_, k) => conn(`Step ${k}`))] } };
+
+      const start = performance.now();
+      const result = await validator.validateWorkflow({ name: 'Triggers', nodes, connections } as any, { validateNodes: false });
+      expect(performance.now() - start).toBeLessThan(2_000);
+      const unreachable = result.warnings.filter((w: any) => w.message === 'Node is not reachable from any trigger node');
+      expect(unreachable.map((w: any) => w.nodeName)).toEqual(['Detached']);
+    });
+  });
+
   describe('cycle detection', () => {
     // A chain from Start; nodes from `backFrom` on also connect back to Start
     const buildChain = (length: number, backFrom: number, backEdges: number, exitAt: number) => {
