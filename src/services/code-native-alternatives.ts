@@ -15,7 +15,6 @@ import { parse } from 'acorn';
 export type NativeAlternativeKind =
   | 'editFields'
   | 'filter'
-  | 'sort'
   | 'removeDuplicates'
   | 'summarize'
   | 'aggregate'
@@ -43,7 +42,6 @@ export type CodeNodeMode = 'runOnceForAllItems' | 'runOnceForEachItem';
 const ALTERNATIVES: Record<NativeAlternativeKind, Omit<NativeAlternative, 'kind' | 'executeOnce'>> = {
   editFields: { node: 'Edit Fields (Set)', nodeType: 'n8n-nodes-base.set', does: 'builds or renames fields' },
   filter: { node: 'Filter', nodeType: 'n8n-nodes-base.filter', does: 'filters items' },
-  sort: { node: 'Sort', nodeType: 'n8n-nodes-base.sort', does: 'sorts items' },
   removeDuplicates: { node: 'Remove Duplicates', nodeType: 'n8n-nodes-base.removeDuplicates', does: 'removes duplicate items' },
   summarize: { node: 'Summarize', nodeType: 'n8n-nodes-base.summarize', does: 'totals a field over the items' },
   aggregate: { node: 'Aggregate', nodeType: 'n8n-nodes-base.aggregate', does: 'collects item values into one list' },
@@ -315,7 +313,8 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     }
   });
 
-  if (disqualified) return undefined;
+  // A local `items` that holds anything but $input.all() would be mistaken for the input
+  if (disqualified || (inits.has('items') && !isItemsSource(inits.get('items')))) return undefined;
   // The node's own returns; a callback's return is its result (see callbackResult)
   const callbacks = [...methods.values()].flat().map(call => call.arguments[0]).filter(Boolean);
   const nodeReturns = returns.filter(ret => !callbacks.some(callback => contains(callback, ret)));
@@ -390,11 +389,9 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
     if (callback.params.length === 3) return isDedupeCallback(callback) ? result('removeDuplicates') : undefined;
     return callback.params.length === 1 && isSimpleCondition(callback) ? result('filter') : undefined;
   }
-  for (const call of callsOnItems('sort')) {
-    const callback = call.arguments[0];
-    if (otherCalls(call).length > 0) return undefined;
-    if (returnedAsItems(call) && isSortKeyComparator(callback)) return result('sort');
-  }
+  // No Sort suggestion: the Sort node compares raw values (strings lowercased), and
+  // without knowing whether a field holds numbers or numeric strings, a comparator
+  // like a.json.score - b.json.score may order differently.
   if (methods.has('sort') || methods.has('filter')) return undefined;
 
   if (methods.has('reduce')) {
@@ -487,23 +484,6 @@ function isSimpleCondition(callback: AstNode): boolean {
 }
 
 /**
- * A comparator that orders by one numeric field: (a, b) => a.json.x - b.json.x, or
- * b - a for descending. The Sort node compares the raw values (strings lowercased),
- * so localeCompare, new Date(...) or Number(...) comparators can order differently.
- */
-function isSortKeyComparator(callback: AstNode | undefined): boolean {
-  if (callback?.type !== 'ArrowFunctionExpression' || callback.params.length !== 2) return false;
-  const [a, b] = callback.params.map((param: AstNode) => param.name);
-  const body = callbackResult(callback);
-  if (body?.type !== 'BinaryExpression' || body.operator !== '-') return false;
-  const left = fieldPath(body.left);
-  const right = fieldPath(body.right);
-  return left !== undefined && right !== undefined && left.segments.length > 0 &&
-    JSON.stringify(left.segments) === JSON.stringify(right.segments) &&
-    ((left.root === a && right.root === b) || (left.root === b && right.root === a));
-}
-
-/**
  * (item, index, all) => all.findIndex(other => other.json.id === item.json.id) === index.
  * all.indexOf(item) compares item objects, which are all distinct, so it removes nothing.
  */
@@ -567,8 +547,9 @@ function isFieldEquality(node: AstNode | undefined, a: string, b: string): boole
   if (node.type !== 'BinaryExpression' || node.operator !== '===') return false;
   const left = fieldPath(node.left);
   const right = fieldPath(node.right);
-  // Compare segment lists: item.json['a.b'] is not item.json.a.b
-  if (!left || !right || left.segments.length === 0 ||
+  // A data field under json (other.json === item.json compares objects, not data), and
+  // segment lists compared as lists: item.json['a.b'] is not item.json.a.b
+  if (!left || !right || left.segments.length < 2 || left.segments[0] !== 'json' ||
       JSON.stringify(left.segments) !== JSON.stringify(right.segments)) return false;
   return (left.root === a && right.root === b) || (left.root === b && right.root === a);
 }

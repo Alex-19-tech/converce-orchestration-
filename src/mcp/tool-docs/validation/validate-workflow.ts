@@ -71,7 +71,7 @@ export const validateWorkflowDoc: ToolDocumentation = {
       'Check statistics to understand workflow complexity',
       '**Auto-sanitization runs during create/update**: Operator structures and missing metadata are automatically fixed when workflows are created or updated, but validation helps catch issues before they reach n8n',
       'If validation detects operator issues, they will be auto-fixed during n8n_create_workflow or n8n_update_partial_workflow',
-      'A short Code node that only maps fields, collects or splits lists, sorts, filters or makes one request gets a NATIVE_ALTERNATIVE warning (ai-friendly, strict) or suggestion (runtime) naming the native node. When the Code node is needed, start its notes with "Why Code:" and the reason'
+      'A short Code node that only maps fields, collects or splits lists, filters, dedupes, totals or makes one request gets a NATIVE_ALTERNATIVE warning (ai-friendly, strict) or suggestion (runtime) naming the native node. When the Code node is needed, start its notes with "Why Code:" and the reason'
     ],
     pitfalls: [
       'Large workflows (100+ nodes) may take longer to validate',

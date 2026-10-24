@@ -47,14 +47,8 @@ describe('findNativeAlternative', () => {
       expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'splitOut', executeOnce: false });
     });
 
-    it('Sort for items sorted by a numeric field, in either direction', () => {
-      expect(kindOf(`return $input.all().sort((a, b) => b.json.score - a.json.score);`)).toBe('sort');
-      expect(kindOf(`return $input.all().sort((a, b) => a.json.score - b.json.score);`)).toBe('sort');
-    });
-
     it('the same suggestions for block-bodied callbacks', () => {
       expect(kindOf(`return $input.all().filter(item => { return item.json.active; });`)).toBe('filter');
-      expect(kindOf(`return $input.all().sort((a, b) => { return a.json.n - b.json.n; });`)).toBe('sort');
       expect(kindOf(`const values = $input.all().map(item => { return item.json.id; });\nreturn [{ json: { values } }];`)).toBe('aggregate');
     });
 
@@ -159,6 +153,9 @@ describe('findNativeAlternative', () => {
       ['a dedupe whose inner item shadows the outer one', `return items.filter((item, i, all) => all.findIndex(item => item.json.id === item.json.id) === i);`],
       ['a list sorted in place next to a filter', `const ignored = $input.first().json.tags.sort();\nreturn $input.all().filter(item => item.json.active);`],
       ['a pairwise precedence comparator', `return items.sort((a, b) => Number(b.json.before.includes(a.json.id)) - Number(a.json.before.includes(b.json.id)));`],
+      ['a numeric sort (the field may hold numeric strings, which Sort compares as text)', `return $input.all().sort((a, b) => b.json.score - a.json.score);`],
+      ['a dedupe comparing whole json objects', `return items.filter((item, i, all) => all.findIndex(other => other.json === item.json) === i);`],
+      ['a local items holding another node', `const items = $('Fetch').all();\nreturn items[0].json.rows.map(row => ({ json: row }));`],
       ['a localeCompare sort (Sort compares raw lowercased values)', `return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name, 'en'));`],
       ['a date sort (Sort compares the raw strings)', `return $input.all().sort((a, b) => new Date(b.json.at) - new Date(a.json.at));`],
       ['a dedupe with loose equality', `return items.filter((item, i, all) => all.findIndex(other => other.json.id == item.json.id) === i);`],
