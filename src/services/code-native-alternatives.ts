@@ -73,10 +73,10 @@ const ALLOWED_METHODS = new Set([
   // items and other nodes
   'first', 'last', 'all',
   // array methods with a callback (checked separately) and plain list methods
-  ...CALLBACK_METHODS, 'join', 'slice', 'flat', 'includes', 'indexOf', 'reverse',
+  ...CALLBACK_METHODS, 'join', 'slice', 'flat', 'includes', 'indexOf',
   // strings
   'trim', 'trimStart', 'trimEnd', 'toLowerCase', 'toUpperCase', 'substring', 'substr',
-  'padStart', 'padEnd', 'startsWith', 'endsWith', 'charAt', 'lastIndexOf', 'toString', 'fromCharCode',
+  'padStart', 'padEnd', 'startsWith', 'endsWith', 'charAt', 'lastIndexOf', 'toString', 'fromCharCode', 'localeCompare',
   // numbers and Math
   'toFixed', 'toLocaleString', 'floor', 'ceil', 'round', 'abs', 'min', 'max', 'random',
   // dates (Date and Luxon)
@@ -245,6 +245,12 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
       case 'Property':
         // { [key]: value } builds a field name at runtime; getters and methods are code
         if ((node.computed && node.key.type !== 'Literal') || node.kind !== 'init' || node.method) disqualified = true;
+        // { json, pairedItem }: linking outputs to chosen inputs, which a node would undo.
+        // A pairedItem field inside json is ordinary data.
+        if (keyName(node) === 'pairedItem' && parent?.type === 'ObjectExpression' &&
+            parent.properties.some((sibling: AstNode) => keyName(sibling) === 'json')) {
+          disqualified = true;
+        }
         break;
       case 'MemberExpression':
         // Binary data, and lookups by a computed key (table[$json.code]), need code
@@ -262,8 +268,15 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
         returns.push(node);
         break;
       case 'VariableDeclarator':
-        if (node.id.type === 'Identifier' && node.init) inits.set(node.id.name, node.init);
-        else disqualified = true; // destructuring, or a variable filled in later
+        // Destructuring, a variable filled in later, or one that hides a global or
+        // n8n name (const String = ...) needs code
+        if (node.id.type === 'Identifier' && node.init && !isReservedName(node.id.name)) inits.set(node.id.name, node.init);
+        else disqualified = true;
+        break;
+      case 'ExpressionStatement':
+        // A statement is either a field assignment (checked below) or a call for its
+        // side effect (list.reverse(), $execution.customData.set(...)), which is code
+        if (node.expression.type !== 'AssignmentExpression') disqualified = true;
         break;
       case 'AssignmentExpression':
         // Setting a field on the current item in per-item mode is what Edit Fields does;
@@ -284,7 +297,8 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
         const body = node.body;
         const simpleBody = body.type !== 'BlockStatement' ||
           (body.body.length === 1 && body.body[0].type === 'ReturnStatement');
-        if (!isCallback || !simpleBody || node.async || node.params.some((p: AstNode) => p.type !== 'Identifier')) {
+        if (!isCallback || !simpleBody || node.async ||
+            node.params.some((p: AstNode) => p.type !== 'Identifier' || isReservedName(p.name))) {
           disqualified = true;
         }
         break;
@@ -390,15 +404,14 @@ function analyze(jsCode: unknown, mode: CodeNodeMode): NativeAlternative | undef
       if (returned) return buildsFields(mapped, resolve) ? result('editFields') : undefined;
       // items.map(...).join('\n') builds one text: Edit Fields run once
       if (isJoined(call, program)) return result('editFields', true);
-      // A field (or fields) read from each item, collected into one item: Aggregate.
-      // Computed values (price * qty) are not something Aggregate does.
-      return usedAsFieldValue(call) && isProjection(mapped, param) ? result('aggregate') : undefined;
+      // One field of each item (item.json.id) or each item's data (item.json), collected
+      // into a field of one item: what Aggregate does. A computed value, or an object
+      // of several fields, needs another node first.
+      return usedAsFieldValue(call) && isAggregatedValue(mapped, param) ? result('aggregate') : undefined;
     }
-    // A list field turned into items, each made of the row's own fields:
-    // $json.rows.map(row => ({ json: { id: row.id } })). Run once for all items,
-    // $json is the first item, so Split Out has to run once too.
-    return mapped.type === 'ObjectExpression' && isProjection(mapped, param) && returned &&
-      isInputField(resolve(call.callee.object))
+    // A list field turned into items, each row as it is: $json.rows.map(row => ({ json: row })).
+    // Run once for all items, $json is the first item, so Split Out has to run once too.
+    return isWholeRowItem(mapped, param) && returned && isInputField(resolve(call.callee.object))
       ? result('splitOut', !perItem)
       : undefined;
   }
@@ -452,7 +465,10 @@ function isSimpleCondition(callback: AstNode): boolean {
   return simple;
 }
 
-/** (item, index, all) => all.findIndex(other => ...) === index, or all.indexOf(item) === index */
+/**
+ * (item, index, all) => all.findIndex(other => other.json.id === item.json.id) === index.
+ * all.indexOf(item) compares item objects, which are all distinct, so it removes nothing.
+ */
 function isDedupeCallback(callback: AstNode): boolean {
   const [item, index, all] = callback.params.map((param: AstNode) => param.name);
   const body = callbackResult(callback);
@@ -461,13 +477,23 @@ function isDedupeCallback(callback: AstNode): boolean {
   const indexSide = sides.find(side => isIdentifier(side, index));
   const lookup = sides.find(side => side !== indexSide);
   if (!indexSide || lookup?.type !== 'CallExpression' || !isIdentifier(lookup.callee.object, all)) return false;
-  const method = propertyName(lookup.callee);
-  if (method === 'indexOf') return isIdentifier(lookup.arguments[0], item);
-  if (method !== 'findIndex') return false;
+  if (propertyName(lookup.callee) !== 'findIndex') return false;
   // The inner predicate says the two items have equal fields: other.json.id === item.json.id
   const inner = lookup.arguments[0];
   if (inner?.type !== 'ArrowFunctionExpression' || inner.params.length !== 1) return false;
   return isFieldEquality(callbackResult(inner), inner.params[0].name, item);
+}
+
+/** item.json.id or item.json: one field, or the whole data, of the callback's item */
+function isAggregatedValue(node: AstNode, param: string | undefined): boolean {
+  const path = fieldPath(node);
+  return path !== undefined && path.root === param && path.segments.length >= 1 && path.segments[0] === 'json';
+}
+
+/** { json: row } */
+function isWholeRowItem(node: AstNode, param: string | undefined): boolean {
+  return node.type === 'ObjectExpression' && node.properties.length === 1 && keyName(node.properties[0]) === 'json' &&
+    !node.properties[0].computed && isIdentifier(node.properties[0].value, param ?? '');
 }
 
 /** a.json.x === b.json.x, optionally joined with && for several fields */
@@ -479,35 +505,29 @@ function isFieldEquality(node: AstNode | undefined, a: string, b: string): boole
   if (node.type !== 'BinaryExpression' || !['===', '=='].includes(node.operator)) return false;
   const left = fieldPath(node.left);
   const right = fieldPath(node.right);
-  if (!left || !right || left.path !== right.path || left.path === '') return false;
+  // Compare segment lists: item.json['a.b'] is not item.json.a.b
+  if (!left || !right || left.segments.length === 0 ||
+      JSON.stringify(left.segments) !== JSON.stringify(right.segments)) return false;
   return (left.root === a && right.root === b) || (left.root === b && right.root === a);
 }
 
-/** item.json.address.city -> { root: 'item', path: 'json.address.city' } */
-function fieldPath(node: AstNode): { root: string; path: string } | undefined {
-  const names: string[] = [];
+/** item.json.address.city -> { root: 'item', segments: ['json', 'address', 'city'] } */
+function fieldPath(node: AstNode): { root: string; segments: string[] } | undefined {
+  const segments: string[] = [];
   let current = node.type === 'ChainExpression' ? node.expression : node;
   while (current.type === 'MemberExpression') {
     const name = propertyName(current);
     if (name === undefined) return undefined;
-    names.unshift(name);
+    segments.unshift(name);
     current = current.object;
   }
-  return current.type === 'Identifier' ? { root: current.name, path: names.join('.') } : undefined;
+  return current.type === 'Identifier' ? { root: current.name, segments } : undefined;
 }
 
-/**
- * A value read straight from the callback's item, or an object of such values:
- * row.id, { id: row.id, name: row.name }, { json: row }.
- */
-function isProjection(node: AstNode | undefined, param: string | undefined): boolean {
-  if (!node || !param) return false;
-  if (node.type === 'ChainExpression') return isProjection(node.expression, param);
-  if (node.type === 'ObjectExpression') {
-    return node.properties.length > 0 && node.properties.every((property: AstNode) =>
-      property.type === 'Property' && !property.computed && (keyName(property) === 'pairedItem' || isProjection(property.value, param)));
-  }
-  return fieldPath(node)?.root === param;
+/** A name a variable or parameter must not hide: a global the analysis trusts, or an n8n $-name. */
+function isReservedName(name: string): boolean {
+  return name.startsWith('$') || ALLOWED_FUNCTIONS.has(name) || CALLBACK_GLOBALS.has(name) ||
+    ['JSON', 'Object'].includes(name);
 }
 
 /** { json: X } or [{ json: X }] -> X */
@@ -542,13 +562,13 @@ function isFieldTotal(call: AstNode): boolean {
 /**
  * Whether a returned value builds fields: an object literal other than a bare
  * `{ json: <existing value> }` wrapper or a lone spread, which only pass an item
- * through. `pairedItem` is item linking, not a field.
+ * through.
  */
 function buildsFields(node: AstNode | undefined, resolve: (node: AstNode | undefined) => AstNode | undefined): boolean {
   if (!node) return false;
   if (node.type === 'ArrayExpression') return node.elements.some((element: AstNode) => buildsFields(element, resolve));
   if (node.type !== 'ObjectExpression') return false;
-  const properties = node.properties.filter((property: AstNode) => keyName(property) !== 'pairedItem');
+  const properties = node.properties;
   if (properties.length === 0) return false;
   if (properties.every((property: AstNode) => property.type === 'SpreadElement')) return false;
   if (properties.length === 1 && keyName(properties[0]) === 'json') return buildsFields(resolve(properties[0].value), resolve);
@@ -616,12 +636,20 @@ function reusesComputedVariable(program: AstNode, inits: Map<string, AstNode>): 
 }
 
 /**
- * A list field of this node's input: $json.rows, items[0].json.rows,
- * $input.first().json.rows. Split Out only sees its input, so a list read from
- * another node ($('Node').first().json.rows) does not count.
+ * A list field of the first input item (or, per item, of the current one):
+ * $json.rows, $input.first().json.rows, $input.item.json.rows, items[0].json.rows.
+ * Split Out only sees its input, and with Execute Once only the first item, so a
+ * list of another node or of another item does not count.
  */
 function isInputField(node: AstNode | undefined): boolean {
   if (node?.type !== 'MemberExpression') return false;
-  const base = rootOf(node);
-  return base?.type === 'Identifier' && ['$json', '$input', 'items'].includes(base.name);
+  let owner: AstNode = node;
+  while (owner.type === 'MemberExpression' && propertyName(owner) !== 'json') owner = owner.object;
+  if (owner.type === 'Identifier') return owner.name === '$json';
+  if (owner.type !== 'MemberExpression') return false;
+  const item = owner.object; // what .json is read from
+  if (isInputItem(item)) return true;
+  if (item.type === 'CallExpression' && propertyName(item.callee) === 'first' && isIdentifier(item.callee.object, '$input')) return true;
+  return item.type === 'MemberExpression' && item.computed && item.property.type === 'Literal' && item.property.value === 0 &&
+    (isIdentifier(item.object, 'items') || isItemsSource(item.object));
 }

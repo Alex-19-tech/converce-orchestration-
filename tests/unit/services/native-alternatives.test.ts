@@ -42,23 +42,27 @@ describe('findNativeAlternative', () => {
     });
 
     it('Split Out for a list field turned into items, run once in all-items mode', () => {
-      const code = `const rows = $json.pages;\nreturn rows.map(row => ({ json: { markdown: row.markdown } }));`;
+      const code = `const rows = $json.pages;\nreturn rows.map(row => ({ json: row }));`;
       expect(findNativeAlternative(code)).toMatchObject({ kind: 'splitOut', executeOnce: true });
       expect(findNativeAlternative(code, 'runOnceForEachItem')).toMatchObject({ kind: 'splitOut', executeOnce: false });
     });
 
-    it('Sort for sorted items', () => {
+    it('Sort for sorted items, numbers or strings', () => {
       expect(kindOf(`return $input.all().sort((a, b) => b.json.score - a.json.score);`)).toBe('sort');
+      expect(kindOf(`return $input.all().sort((a, b) => a.json.name.localeCompare(b.json.name));`)).toBe('sort');
+    });
+
+    it('Edit Fields when the item data holds a field named pairedItem', () => {
+      expect(kindOf(`return items.map(item => ({ json: { id: item.json.id, pairedItem: item.json.ref } }));`)).toBe('editFields');
     });
 
     it('Filter for items kept by a condition on the item', () => {
       expect(kindOf(`return $input.all().filter(item => item.json.status === 'active');`)).toBe('filter');
     });
 
-    it('Remove Duplicates for a findIndex or indexOf dedupe', () => {
+    it('Remove Duplicates for a findIndex dedupe on equal fields', () => {
       expect(kindOf(`return items.filter((item, index, all) => all.findIndex(other => other.json.id === item.json.id) === index);`))
         .toBe('removeDuplicates');
-      expect(kindOf(`return items.filter((item, i, all) => all.indexOf(item) === i);`)).toBe('removeDuplicates');
     });
 
     it('Summarize for a numeric total', () => {
@@ -133,6 +137,14 @@ describe('findNativeAlternative', () => {
       ['a request whose response is discarded', `await this.helpers.httpRequest({ url: 'https://example.com' });\nreturn [{ json: { status: 'done' } }];`],
       ['a side effect through an unknown call', `$execution.customData.set('processed', 'yes');\nreturn { json: { ok: true } };`],
       ['a call through an expression', `return { json: { a: ($json.f || String)($json.x) } };`],
+      ['indexOf on item objects (each item is a distinct object)', `return items.filter((item, i, all) => all.indexOf(item) === i);`],
+      ['a dotted key compared with a nested path', `return items.filter((item, i, all) => all.findIndex(other => other.json['a.b'] === item.json.a.b) === i);`],
+      ['an allowlisted name hidden by a variable', `const String = $execution.customData.set;\nString('processed', 'yes');\nreturn { json: { ok: true } };`],
+      ['a call made for its side effect', `$input.first().json.tags.reverse();\nreturn $input.all().filter(item => item.json.active);`],
+      ['rows mapped to renamed fields (Split Out keeps the row)', `return $json.rows.map(row => ({ json: { renamed: row.id } }));`],
+      ['objects of renamed fields collected (Aggregate collects fields as they are)', `return [{ json: { values: $input.all().map(item => ({ renamed: item.json.id })) } }];`],
+      ['a list of another item', `return items[2].json.rows.map(row => ({ json: row }));`],
+      ['outputs linked to a chosen input', `return items.map(item => ({ json: { id: item.json.id }, pairedItem: { item: 1 } }));`],
       ['a variable filled in later', `let x;\nreturn { json: { x } };`],
       ['a multi-statement callback', `return $input.all().map(item => { const t = item.json.title; return { json: { t } }; });`],
     ])('%s', (_label, code) => {
