@@ -1068,4 +1068,90 @@ describe('WorkflowValidator - Loop Node Validation', () => {
       expect(cycleWarnings).toHaveLength(1);
     });
   });
+  describe('large workflows', () => {
+    const buildLoopWorkflow = (loops: number, downstream: number, withExpressions: boolean) => {
+      const nodes: any[] = Array.from({ length: loops }, (_, i) => ({
+        id: `s${i}`, name: `Loop ${i}`, type: 'n8n-nodes-base.splitInBatches', position: [0, 0], parameters: {}
+      }));
+      nodes.push({ id: 'p', name: 'Process Item', type: 'n8n-nodes-base.code', position: [0, 0], parameters: {} });
+      for (let k = 0; k < downstream; k++) {
+        nodes.push({
+          id: `k${k}`, name: `Step ${k}`, type: 'n8n-nodes-base.noOp', position: [0, 0],
+          parameters: withExpressions ? { value: `={{ $('Loop ${k}').item.json.x }}` } : {}
+        });
+      }
+      const connections: any = {
+        'Process Item': { main: [Array.from({ length: downstream }, (_, k) => ({ node: `Step ${k}`, type: 'main', index: 0 }))] }
+      };
+      for (let i = 0; i < loops; i++) {
+        connections[`Loop ${i}`] = { main: [[{ node: 'Process Item', type: 'main', index: 0 }], [{ node: 'Process Item', type: 'main', index: 0 }]] };
+      }
+      return { name: 'Large', nodes, connections };
+    };
+
+    it('handles many loop nodes feeding one node with many downstream nodes', async () => {
+      mockNodeRepository.getNode.mockReturnValue(null);
+      const start = performance.now();
+      const result = await validator.validateWorkflow(buildLoopWorkflow(4000, 4000, false) as any, { validateNodes: false });
+      expect(performance.now() - start).toBeLessThan(2_000);
+      expect(result.warnings.some(w => w.message?.includes("doesn't connect back"))).toBe(true);
+    });
+
+    it('handles many nodes with expressions that reference other nodes', async () => {
+      mockNodeRepository.getNode.mockReturnValue(null);
+      const start = performance.now();
+      const result = await validator.validateWorkflow(buildLoopWorkflow(8000, 8000, true) as any, { validateNodes: false, validateConnections: false });
+      expect(performance.now() - start).toBeLessThan(2_000);
+      expect(result.errors.some(e => e.message?.includes('not found in workflow'))).toBe(false);
+    });
+
+    it('still reports reversed loop outputs when another loop has many connections', async () => {
+      mockNodeRepository.getNode.mockReturnValue(null);
+      const loop = (name: string) => ({ id: name, name, type: 'n8n-nodes-base.splitInBatches', position: [0, 0], parameters: {} });
+      const step = (name: string) => ({ id: name, name, type: 'n8n-nodes-base.noOp', position: [0, 0], parameters: {} });
+      const conn = (node: string) => ({ node, type: 'main', index: 0 });
+      const workflow = {
+        name: 'Two loops',
+        nodes: [loop('Loop A'), step('Body A'), loop('Loop B'), step('Process B')],
+        connections: {
+          'Loop A': { main: [[], [conn('Body A')]] },
+          'Body A': { main: [[conn('Loop A'), ...Array.from({ length: 200_000 }, () => conn('Body A'))]] },
+          'Loop B': { main: [[conn('Process B')], []] },
+          'Process B': { main: [[conn('Loop B')]] }
+        }
+      };
+      const result = await validator.validateWorkflow(workflow as any, { validateNodes: false });
+      expect(result.errors.some(e => e.nodeName === 'Loop B' && e.message.includes('appear reversed'))).toBe(true);
+      expect(result.valid).toBe(false);
+      expect(result.warnings.some(w => w.message.includes('too large to check fully'))).toBe(false);
+    });
+
+    it('handles many loops that share a wide downstream graph', async () => {
+      mockNodeRepository.getNode.mockReturnValue(null);
+      const loops = 3_000;
+      const leaves = 3_000;
+      const nodes: any[] = [{ id: 'hub', name: 'Hub', type: 'n8n-nodes-base.noOp', position: [0, 0], parameters: {} }];
+      const connections: any = {
+        Hub: { main: [Array.from({ length: leaves }, (_, j) => ({ node: `Leaf ${j}`, type: 'main', index: 0 }))] }
+      };
+      for (let j = 0; j < leaves; j++) {
+        nodes.push({ id: `l${j}`, name: `Leaf ${j}`, type: 'n8n-nodes-base.noOp', position: [0, 0], parameters: {} });
+      }
+      for (let i = 0; i < loops; i++) {
+        nodes.push({ id: `s${i}`, name: `Loop ${i}`, type: 'n8n-nodes-base.splitInBatches', position: [0, 0], parameters: {} });
+        nodes.push({ id: `b${i}`, name: `Body ${i}`, type: 'n8n-nodes-base.noOp', position: [0, 0], parameters: {} });
+        connections[`Loop ${i}`] = { main: [[], [{ node: `Body ${i}`, type: 'main', index: 0 }]] };
+        connections[`Body ${i}`] = { main: [[{ node: 'Hub', type: 'main', index: 0 }]] };
+      }
+      const start = performance.now();
+      const result = await validator.validateWorkflow({ name: 'Wide', nodes, connections } as any, { validateNodes: false });
+      expect(performance.now() - start).toBeLessThan(2_000);
+      const incomplete = result.warnings.filter(w => w.message.includes('too large to check fully'));
+      expect(incomplete).toHaveLength(1);
+      expect(incomplete[0].nodeName).toBeUndefined();
+      const noLoopBack = result.warnings.filter(w => w.message.includes("doesn't connect back")).length;
+      expect(noLoopBack).toBeGreaterThan(0);
+      expect(noLoopBack).toBeLessThan(loops);
+    });
+  });
 });

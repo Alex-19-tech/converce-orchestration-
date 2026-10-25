@@ -19,6 +19,13 @@ export interface SimilarityScore {
   totalScore: number;
 }
 
+interface PreparedQuery {
+  cleanInvalid: string;
+  isShortSearch: boolean;
+  invalidTokens: Set<string>;
+  invalidPackage: string;
+}
+
 export interface CommonMistakePattern {
   pattern: string;
   suggestion: string;
@@ -159,9 +166,11 @@ export class NodeSimilarityService {
     const allNodes = await this.getCachedNodes();
 
     // Calculate similarity scores for all nodes
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): prepare the invalid type once
+    const query = this.prepareQuery(invalidType);
     const scores = allNodes.map(node => ({
       node,
-      score: this.calculateSimilarityScore(invalidType, node)
+      score: this.calculateSimilarityScore(query, node)
     }));
 
     // Sort by total score and filter high scores
@@ -262,13 +271,25 @@ export class NodeSimilarityService {
   /**
    * Calculate multi-factor similarity score
    */
-  private calculateSimilarityScore(invalidType: string, node: any): SimilarityScore {
+  /**
+   * Values derived from the invalid type alone, shared by every node's score
+   */
+  private prepareQuery(invalidType: string): PreparedQuery {
     const cleanInvalid = this.normalizeNodeType(invalidType);
+    return {
+      cleanInvalid,
+      // Special handling for very short search terms (e.g., "http", "sheet")
+      isShortSearch: invalidType.length <= NodeSimilarityService.SHORT_SEARCH_LENGTH,
+      invalidTokens: new Set(invalidType.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)),
+      invalidPackage: cleanInvalid.split(/[.-]/)[0]
+    };
+  }
+
+  private calculateSimilarityScore(invalidType: string | PreparedQuery, node: any): SimilarityScore {
+    const query = typeof invalidType === 'string' ? this.prepareQuery(invalidType) : invalidType;
+    const { cleanInvalid, isShortSearch, invalidTokens, invalidPackage } = query;
     const cleanValid = this.normalizeNodeType(node.nodeType);
     const displayNameClean = this.normalizeNodeType(node.displayName);
-
-    // Special handling for very short search terms (e.g., "http", "sheet")
-    const isShortSearch = invalidType.length <= NodeSimilarityService.SHORT_SEARCH_LENGTH;
 
     // Name similarity (40% weight)
     let nameSimilarity = Math.max(
@@ -288,8 +309,7 @@ export class NodeSimilarityService {
     if (node.category) {
       const categoryClean = this.normalizeNodeType(node.category);
       if (categoryClean.length >= NodeSimilarityService.MIN_CATEGORY_MATCH_LENGTH) {
-        const invalidTokens = invalidType.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-        if (invalidTokens.includes(categoryClean)) {
+        if (invalidTokens.has(categoryClean)) {
           categoryMatch = 20;
         }
       }
@@ -297,10 +317,9 @@ export class NodeSimilarityService {
 
     // Package match (15% weight)
     let packageMatch = 0;
-    const invalidParts = cleanInvalid.split(/[.-]/);
     const validParts = cleanValid.split(/[.-]/);
 
-    if (invalidParts[0] === validParts[0]) {
+    if (invalidPackage === validParts[0]) {
       packageMatch = 15;
     }
 

@@ -32,6 +32,19 @@ describe('NodeSimilarityService', () => {
     vi.restoreAllMocks();
   });
 
+  describe('long input', () => {
+    it('handles a long unknown node type', async () => {
+      const nodes = Array.from({ length: 3000 }, (_, i) => ({ ...createMockNode(`nodes-base.node${i}`, `Node ${i}`), category: 'transform' }));
+      vi.spyOn(mockRepository, 'getAllNodes').mockReturnValue(nodes);
+      vi.spyOn(mockRepository, 'getNode').mockReturnValue(null);
+
+      const start = performance.now();
+      const suggestions = await service.findSimilarNodes('n8n-nodes-base.' + 'q'.repeat(1_000_000));
+      expect(performance.now() - start).toBeLessThan(2_000);
+      expect(suggestions).toEqual([]);
+    });
+  });
+
   describe('Cache Management', () => {
     it('should invalidate cache when requested', () => {
       service.invalidateCache();

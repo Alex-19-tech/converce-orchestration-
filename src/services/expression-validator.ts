@@ -15,7 +15,7 @@ interface ExpressionValidationResult {
 }
 
 interface ExpressionContext {
-  availableNodes: string[];
+  availableNodes: string[] | { has(name: string): boolean };
   currentNodeName?: string;
   isInLoop?: boolean;
   hasInputData?: boolean;
@@ -273,7 +273,8 @@ export class ExpressionValidator {
     context: ExpressionContext
   ): void {
     for (const nodeName of result.usedNodes) {
-      if (!context.availableNodes.includes(nodeName)) {
+      const available = context.availableNodes;
+      if (!(Array.isArray(available) ? available.includes(nodeName) : available.has(nodeName))) {
         result.errors.push(
           `Referenced node "${nodeName}" not found in workflow`
         );
