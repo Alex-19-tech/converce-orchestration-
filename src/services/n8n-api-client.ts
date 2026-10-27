@@ -1349,10 +1349,11 @@ export class N8nApiClient {
         method: httpMethod,
         url: webhookPath,
         headers: {
-          ...headers,
+          // Webhook endpoints never receive an n8n API key header.
+          ...Object.fromEntries(
+            Object.entries(headers ?? {}).filter(([name]) => name.trim().toLowerCase() !== 'x-n8n-api-key')
+          ),
           ...(forwardCfHeaders ? this.cfAccessHeaders() : {}),
-          // Don't override API key header for webhook endpoints
-          'X-N8N-API-KEY': undefined,
         },
         data: httpMethod !== 'GET' ? data : undefined,
         params: httpMethod === 'GET' ? data : undefined,

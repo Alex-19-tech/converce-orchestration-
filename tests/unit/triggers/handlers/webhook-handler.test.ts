@@ -193,6 +193,64 @@ describe('WebhookHandler', () => {
       );
     });
 
+    describe('webhook path confinement (GHSA-q7jr-6fm4-vvhg)', () => {
+      const run = (webhookPath: string, h: WebhookHandler = handler) =>
+        h.execute(
+          { workflowId: 'workflow-123', triggerType: 'webhook' as const, webhookPath },
+          createWorkflow()
+        );
+
+      beforeEach(() => {
+        vi.mocked(mockClient.triggerWebhook).mockResolvedValue({
+          status: 200,
+          statusText: 'OK',
+          data: {},
+        });
+      });
+
+      it.each([
+        '../rest/settings',
+        '../../api/v1/workflows',
+        '%2e%2e/rest/settings',
+        '%2E%2E/%2e%2E/rest/login',
+        '.%2e/rest/settings',
+        '..\\rest\\settings',
+        'a/../../rest/settings',
+        '..',
+        '..%2f..%2fapi/v1/workflows',
+        '%2e%2e%2frest/settings',
+        '..%5crest',
+        'a%2Fb',
+      ])('rejects %s', async (webhookPath) => {
+        const response = await run(webhookPath);
+        expect(response.success).toBe(false);
+        expect(response.error).toContain('Invalid webhook path');
+        expect(mockClient.triggerWebhook).not.toHaveBeenCalled();
+      });
+
+      it.each(['custom-path', 'a/b/c', 'a/../b', 'with..dots', 'id/:param'])(
+        'accepts %s',
+        async (webhookPath) => {
+          expect((await run(webhookPath)).success).toBe(true);
+        }
+      );
+
+      it('keeps the base path of an n8n served under a sub-path', async () => {
+        const scoped = new WebhookHandler(mockClient, {
+          n8nApiUrl: 'https://test.n8n.com/n8n/api/v1',
+          n8nApiKey: 'k',
+        });
+        expect((await run('hook', scoped)).success).toBe(true);
+        expect(mockClient.triggerWebhook).toHaveBeenCalledWith(
+          expect.objectContaining({ webhookUrl: 'https://test.n8n.com/n8n/webhook/hook' })
+        );
+
+        vi.mocked(mockClient.triggerWebhook).mockClear();
+        expect((await run('../../webhook/hook', scoped)).success).toBe(false);
+        expect(mockClient.triggerWebhook).not.toHaveBeenCalled();
+      });
+    });
+
     it('should use trigger info when no explicit path provided', async () => {
       const input = {
         workflowId: 'workflow-123',
