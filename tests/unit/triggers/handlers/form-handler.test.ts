@@ -226,6 +226,28 @@ describe('FormHandler', () => {
       );
     });
 
+    it('rejects a form path outside the form prefix', async () => {
+      const response = await handler.execute(
+        { workflowId: 'workflow-123', triggerType: 'form' as const, formData: { field: 'value' } },
+        createWorkflow(),
+        {
+          type: 'form',
+          node: {
+            id: 'form-node',
+            name: 'Form',
+            type: 'n8n-nodes-base.formTrigger',
+            typeVersion: 1,
+            position: [0, 0],
+            parameters: { path: '%2e%2e/rest/settings' },
+          },
+        }
+      );
+
+      expect(response.success).toBe(false);
+      expect(response.error).toContain('Invalid form path');
+      expect(axios.request).not.toHaveBeenCalled();
+    });
+
     it('should use workflow ID as fallback path', async () => {
       const input = {
         workflowId: 'workflow-456',

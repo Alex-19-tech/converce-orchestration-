@@ -1134,6 +1134,72 @@ describe('SSRFProtection', () => {
     });
   });
 
+  describe('hostname normalization (GHSA-qm7x-j9xp-x3gv)', () => {
+    beforeEach(() => {
+      delete process.env.WEBHOOK_SECURITY_MODE;
+    });
+
+    it.each([
+      'http://metadata.google.internal./computeMetadata/v1/',
+      'http://metadata./',
+      'http://METADATA.GOOGLE.INTERNAL../',
+    ])('rejects metadata hostname %s in every mode', async (url) => {
+      for (const mode of ['strict', 'moderate', 'permissive']) {
+        process.env.WEBHOOK_SECURITY_MODE = mode;
+        expect(SSRFProtection.validateUrlSync(url)).toEqual({
+          valid: false,
+          reason: 'Cloud metadata endpoint blocked',
+        });
+        const result = await SSRFProtection.validateWebhookUrl(url);
+        expect(result.valid).toBe(false);
+        expect(result.reason).toBe('Cloud metadata endpoint blocked');
+      }
+    });
+
+    it.each([
+      'http://localhost.:5678/',
+      'http://localhost.localdomain.:5678/',
+      'http://admin.localhost:5678/',
+      'http://a.b.localhost.:5678/',
+    ])('treats %s as localhost', async (url) => {
+      process.env.WEBHOOK_SECURITY_MODE = 'strict';
+      expect(SSRFProtection.validateUrlSync(url).valid).toBe(false);
+      // DNS mock answers a public address, so only the hostname check can refuse it
+      const strict = await SSRFProtection.validateWebhookUrl(url);
+      expect(strict.valid).toBe(false);
+      expect(strict.reason).toBe('Localhost access is blocked in strict mode');
+
+      process.env.WEBHOOK_SECURITY_MODE = 'moderate';
+      expect(SSRFProtection.validateUrlSync(url).valid).toBe(true);
+      expect((await SSRFProtection.validateWebhookUrl(url)).valid).toBe(true);
+    });
+
+    it('checks the resolved address of a *.localhost name in moderate mode', async () => {
+      process.env.WEBHOOK_SECURITY_MODE = 'moderate';
+      vi.mocked(dns.lookup).mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }] as any);
+      const privateAnswer = await SSRFProtection.validateWebhookUrl('http://app.localhost/');
+      expect(privateAnswer.valid).toBe(false);
+      expect(privateAnswer.reason).toContain('Private IP');
+
+      vi.mocked(dns.lookup).mockResolvedValueOnce([{ address: '127.0.0.1', family: 4 }] as any);
+      expect((await SSRFProtection.validateWebhookUrl('http://app.localhost/')).valid).toBe(true);
+    });
+
+    it('does not treat names that only contain "localhost" as localhost', async () => {
+      for (const url of ['http://localhost.example.com/', 'http://mylocalhost/']) {
+        expect(SSRFProtection.validateUrlSync(url).valid).toBe(true);
+        expect((await SSRFProtection.validateWebhookUrl(url)).valid).toBe(true);
+      }
+    });
+
+    it('accepts a public hostname with a trailing dot', async () => {
+      expect(SSRFProtection.validateUrlSync('https://n8n.example.com./').valid).toBe(true);
+      const result = await SSRFProtection.validateWebhookUrl('https://n8n.example.com./');
+      expect(result.valid).toBe(true);
+      expect(dns.lookup).toHaveBeenCalledWith('n8n.example.com', { all: true });
+    });
+  });
+
   // SECURITY (GHSA-cmrh-wvq6-wm9r): pinned-transport regression tests.
   describe('Transport pinning', () => {
     beforeEach(() => {

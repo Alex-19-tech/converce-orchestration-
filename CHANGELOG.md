@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.99.2] - 2026-10-27
+
+### Security
+
+- Fix hostname normalization in SSRF protection (GHSA-qm7x-j9xp-x3gv). Reported by @ccsimplyspolit.
+- Fix session isolation in multi-tenant HTTP mode and path handling in `n8n_test_workflow` (GHSA-q7jr-6fm4-vvhg). Reported by @3099404236.
+
+### Changed
+
+- Webhook and API URLs with a trailing dot on the hostname are checked as the same host without the dot, and `*.localhost` names are treated as localhost.
+- In multi-tenant mode with the `instance` session strategy, a new session only replaces existing sessions with the same instance URL, instance ID and n8n API key. Sessions of the same instance ID with another URL or key end on their normal idle timeout.
+- `initialize` always gets a server-generated session ID. A client-supplied `mcp-session-id` header on `initialize` is ignored.
+- `n8n_test_workflow` refuses webhook, chat and form paths that do not stay under the instance's `/webhook/` or `/form/` path.
+
 ## [2.99.1] - 2026-10-24
 
 ### Security

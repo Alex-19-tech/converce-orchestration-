@@ -311,11 +311,28 @@ describe('N8nApiClient', () => {
           headers: expect.objectContaining({
             'CF-Access-Client-Id': 'cf-id',
             'CF-Access-Client-Secret': 'cf-secret',
-            // API key is never forwarded to webhook endpoints.
-            'X-N8N-API-KEY': undefined,
           }),
         })
       );
+    });
+
+    it('drops caller-supplied API key headers from webhook executions in any case', async () => {
+      client = new N8nApiClient(cfConfig);
+      const mockWebhookClient = {
+        request: vi.fn().mockResolvedValue({ status: 200, statusText: 'OK', data: {}, headers: {} }),
+      };
+      vi.mocked(axios.create).mockReturnValue(mockWebhookClient as any);
+
+      await client.triggerWebhook({
+        webhookUrl: 'https://n8n.example.com/webhook/abc-123',
+        httpMethod: 'POST',
+        headers: { 'x-n8n-api-key': 'a', 'X-N8N-API-KEY': 'b', 'X-N8n-Api-Key': 'c', ' x-n8n-api-key ': 'd', 'X-Custom': 'kept' },
+        waitForResponse: false,
+      });
+
+      const sent = mockWebhookClient.request.mock.calls[0][0].headers;
+      expect(Object.keys(sent).filter(name => name.trim().toLowerCase() === 'x-n8n-api-key')).toEqual([]);
+      expect(sent['X-Custom']).toBe('kept');
     });
 
     it('omits CF headers from webhook executions when not configured', async () => {
@@ -2126,7 +2143,6 @@ badRequest('request/body/nodeGroups/0 must NOT have additional properties')
         url: '/webhook/abc-123',
         headers: {
           'Custom-Header': 'test',
-          'X-N8N-API-KEY': undefined,
         },
         data: { key: 'value' },
         params: undefined,
