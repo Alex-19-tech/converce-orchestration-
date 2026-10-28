@@ -1,7 +1,7 @@
 name: Test Suite
 on:
   push:
-    branches: [main, feat/comprehensive-testing-suite]
+    branches: [main, feat/comprehensive-testing-suite, feat/workflow-builder-agent]
     paths-ignore:
       - '**.md'
       - '**.txt'

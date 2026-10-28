@@ -14,6 +14,12 @@ vi.mock('dns/promises', () => ({
 }));
 
 vi.mock('../../../src/utils/logger', () => ({
+  Logger: class {
+    debug = vi.fn();
+    error = vi.fn();
+    info = vi.fn();
+    warn = vi.fn();
+  },
   logger: {
     info: vi.fn(),
     error: vi.fn(),

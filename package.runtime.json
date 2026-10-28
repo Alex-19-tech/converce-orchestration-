@@ -6,6 +6,8 @@
   "dependencies": {
     "acorn": "^8.16.0",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "n8n-nodes-base": "2.44.3",
+    "n8n-workflow": "2.44.2",
     "express": "^5.1.0",
     "express-rate-limit": "^7.1.5",
     "dotenv": "^16.5.0",
@@ -16,12 +18,18 @@
     "tslib": "^2.6.2",
     "undici": "^6.29.0",
     "uuid": "^11.1.1",
-    "axios": "^1.20.0"
+    "axios": "^1.20.0",
+    "openai": "^4.77.0",
+    "zod": "3.25.76"
   },
   "engines": {
     "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
   "optionalDependencies": {
     "better-sqlite3": "^11.10.0"
+  },
+  "overrides": {
+    "pyodide": "0.26.4",
+    "isolated-vm": "npm:empty-npm-package@1.0.0"
   }
 }
