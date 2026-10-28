@@ -14,6 +14,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../../src/utils/logger', () => ({
+  Logger: class {
+    debug = vi.fn();
+    error = vi.fn();
+    info = vi.fn();
+    warn = vi.fn();
+  },
   logger: {
     info: vi.fn(),
     error: vi.fn(),

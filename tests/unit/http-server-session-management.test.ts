@@ -4,6 +4,12 @@ import { SingleSessionHTTPServer } from '../../src/http-server-single-session';
 
 // Mock dependencies
 vi.mock('../../src/utils/logger', () => ({
+  Logger: class {
+    debug = vi.fn();
+    error = vi.fn();
+    info = vi.fn();
+    warn = vi.fn();
+  },
   logger: {
     info: vi.fn(),
     error: vi.fn(),

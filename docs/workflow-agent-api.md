@@ -4,7 +4,7 @@ The self-hosted HTTP server exposes a two-step REST API for a frontend that coll
 
 ## Configuration
 
-Set the usual HTTP server settings (`MCP_MODE=http`, `AUTH_TOKEN`) and an n8n API target (`N8N_API_URL` and `N8N_API_KEY`). In multi-tenant mode, provide `x-n8n-url` and `x-n8n-key` on both requests instead.
+Set the usual HTTP server settings (`MCP_MODE=http`, `AUTH_TOKEN`) and an n8n API target (`N8N_API_URL` and `N8N_API_KEY`). The agent also requires the node database at `NODE_DB_PATH`; it defaults to `data/nodes.db` in the working directory, and the Railway image includes the bundled catalog at that path. In multi-tenant mode, provide `x-n8n-url` and `x-n8n-key` on both requests instead.
 
 Configure the model on the server:
 

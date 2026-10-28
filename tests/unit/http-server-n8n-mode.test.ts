@@ -763,6 +763,142 @@ describe('HTTP Server n8n Mode', () => {
 
       expect(createRequest.res.status).toHaveBeenCalledWith(409);
     });
+
+    it('rejects invalid plan and create request bodies', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+
+      const planRequest = authorizedRequest({ goal: '  ' });
+      await findHandler('post', '/api/agent/plan')(planRequest.req, planRequest.res);
+      expect(planRequest.res.status).toHaveBeenCalledWith(400);
+
+      const createRequest = authorizedRequest({ approved: true });
+      await findHandler('post', '/api/agent/create')(createRequest.req, createRequest.res);
+      expect(createRequest.res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('requires bearer authentication and an n8n target', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      const planHandler = findHandler('post', '/api/agent/plan');
+      const createHandler = findHandler('post', '/api/agent/create');
+
+      const unauthenticatedPlan = createMockReqRes();
+      unauthenticatedPlan.req.method = 'POST';
+      unauthenticatedPlan.req.body = { goal: 'Create a webhook workflow' };
+      await planHandler(unauthenticatedPlan.req, unauthenticatedPlan.res);
+      expect(unauthenticatedPlan.res.status).toHaveBeenCalledWith(401);
+
+      const unauthenticatedCreate = createMockReqRes();
+      unauthenticatedCreate.req.method = 'POST';
+      unauthenticatedCreate.req.body = {};
+      await createHandler(unauthenticatedCreate.req, unauthenticatedCreate.res);
+      expect(unauthenticatedCreate.res.status).toHaveBeenCalledWith(401);
+
+      delete process.env.N8N_API_URL;
+      delete process.env.N8N_API_KEY;
+      process.env.ENABLE_MULTI_TENANT = 'false';
+      const missingTarget = authorizedRequest({ goal: 'Create a webhook workflow' });
+      await planHandler(missingTarget.req, missingTarget.res);
+      expect(missingTarget.res.status).toHaveBeenCalledWith(503);
+    });
+
+    it('rejects a draft that fails workflow validation', async () => {
+      process.env.N8N_API_URL = 'https://n8n.example.test';
+      process.env.N8N_API_KEY = 'test-n8n-api-key';
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      attachApprovalDatabase();
+      const agent = {
+        plan: vi.fn().mockResolvedValue({
+          status: 'ready', summary: 'Draft ready.', questions: [], workflow,
+          validation: { valid: true, errors: [], warnings: [] },
+        }),
+        validate: vi.fn().mockResolvedValue({
+          valid: false,
+          errors: [{ node: 'Webhook', message: 'Invalid webhook configuration' }],
+          warnings: [],
+        }),
+      };
+      vi.spyOn(server as any, 'getWorkflowBuilderAgent').mockResolvedValue(agent);
+      vi.spyOn(n8nHandlers, 'getN8nApiClient').mockReturnValue({} as any);
+      const createWorkflow = vi.spyOn(n8nHandlers, 'handleCreateWorkflow');
+
+      const planRequest = authorizedRequest({ goal: 'Create a webhook workflow' });
+      await findHandler('post', '/api/agent/plan')(planRequest.req, planRequest.res);
+      const planResponse = (planRequest.res.json as any).mock.calls[0][0];
+      const createRequest = authorizedRequest({
+        approved: true,
+        draftToken: planResponse.draftToken,
+        workflow: planResponse.plan.workflow,
+      });
+      await findHandler('post', '/api/agent/create')(createRequest.req, createRequest.res);
+
+      expect(createRequest.res.status).toHaveBeenCalledWith(422);
+      expect(createWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('rejects an expired approval token', async () => {
+      process.env.N8N_API_URL = 'https://n8n.example.test';
+      process.env.N8N_API_KEY = 'test-n8n-api-key';
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      attachApprovalDatabase();
+      vi.spyOn(server as any, 'getWorkflowBuilderAgent').mockResolvedValue({
+        plan: vi.fn().mockResolvedValue({
+          status: 'ready', summary: 'Draft ready.', questions: [], workflow,
+          validation: { valid: true, errors: [], warnings: [] },
+        }),
+      });
+
+      const planRequest = authorizedRequest({ goal: 'Create a webhook workflow' });
+      await findHandler('post', '/api/agent/plan')(planRequest.req, planRequest.res);
+      const planResponse = (planRequest.res.json as any).mock.calls[0][0];
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(planResponse.expiresAt + 1);
+      const createRequest = authorizedRequest({
+        approved: true,
+        draftToken: planResponse.draftToken,
+        workflow: planResponse.plan.workflow,
+      });
+      await findHandler('post', '/api/agent/create')(createRequest.req, createRequest.res);
+      nowSpy.mockRestore();
+
+      expect(createRequest.res.status).toHaveBeenCalledWith(401);
+    });
+
+    it('reports n8n workflow creation failures', async () => {
+      process.env.N8N_API_URL = 'https://n8n.example.test';
+      process.env.N8N_API_KEY = 'test-n8n-api-key';
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      attachApprovalDatabase();
+      const agent = {
+        plan: vi.fn().mockResolvedValue({
+          status: 'ready', summary: 'Draft ready.', questions: [], workflow,
+          validation: { valid: true, errors: [], warnings: [] },
+        }),
+        validate: vi.fn().mockResolvedValue({ valid: true, errors: [], warnings: [] }),
+      };
+      vi.spyOn(server as any, 'getWorkflowBuilderAgent').mockResolvedValue(agent);
+      vi.spyOn(n8nHandlers, 'getN8nApiClient').mockReturnValue({} as any);
+      vi.spyOn(n8nHandlers, 'handleCreateWorkflow').mockResolvedValue({
+        success: false,
+        error: 'n8n rejected workflow creation',
+      } as any);
+
+      const planRequest = authorizedRequest({ goal: 'Create a webhook workflow' });
+      await findHandler('post', '/api/agent/plan')(planRequest.req, planRequest.res);
+      const planResponse = (planRequest.res.json as any).mock.calls[0][0];
+      const createRequest = authorizedRequest({
+        approved: true,
+        draftToken: planResponse.draftToken,
+        workflow: planResponse.plan.workflow,
+      });
+      await findHandler('post', '/api/agent/create')(createRequest.req, createRequest.res);
+
+      expect(createRequest.res.status).toHaveBeenCalledWith(422);
+      expect(createRequest.res.json).toHaveBeenCalledWith(expect.objectContaining({ success: false }));
+    });
   });
 
   describe('404 Handler', () => {
