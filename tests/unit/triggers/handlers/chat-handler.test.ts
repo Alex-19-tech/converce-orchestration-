@@ -249,6 +249,19 @@ describe('ChatHandler', () => {
       );
     });
 
+    it('rejects a chat path outside the webhook prefix', async () => {
+      const workflow = createWorkflow();
+      const response = await handler.execute(
+        { workflowId: 'workflow-123', triggerType: 'chat' as const, message: 'Hi' },
+        workflow,
+        { type: 'chat', node: workflow.nodes[0], webhookPath: '../../rest/settings?x=' }
+      );
+
+      expect(response.success).toBe(false);
+      expect(response.error).toContain('Invalid webhook path');
+      expect(axios.request).not.toHaveBeenCalled();
+    });
+
     it('should use workflow ID as fallback when no trigger info', async () => {
       const input = {
         workflowId: 'workflow-123',

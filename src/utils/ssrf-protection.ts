@@ -138,6 +138,23 @@ export class SSRFProtection {
     return LOCALHOST_PATTERNS.has(host) || (isIPv4(host) && host.startsWith('127.'));
   }
 
+  /** SECURITY (GHSA-qm7x-j9xp-x3gv): RFC 6761 `*.localhost` names. */
+  private static isLocalhostSubdomain(host: string): boolean {
+    return host.endsWith('.localhost');
+  }
+
+  /**
+   * SECURITY (GHSA-qm7x-j9xp-x3gv): the form every hostname check compares:
+   * lowercase, without IPv6 brackets or trailing dots. Empty when nothing is left.
+   */
+  private static normalizeHostname(url: URL): string {
+    let hostname = url.hostname.toLowerCase();
+    if (hostname.startsWith('[') && hostname.endsWith(']')) {
+      hostname = hostname.slice(1, -1);
+    }
+    return hostname.replace(/\.+$/, '');
+  }
+
   /**
    * IPv6 addresses that must be blocked: loopback, unspecified, link-local,
    * unique-local, site-local (deprecated), multicast, IPv4-mapped,
@@ -345,11 +362,9 @@ export class SSRFProtection {
         return { valid: false, reason: 'Invalid protocol. Only HTTP/HTTPS allowed.' };
       }
 
-      // Get hostname and strip IPv6 brackets if present
-      let hostname = url.hostname.toLowerCase();
-      // Remove IPv6 brackets for consistent comparison
-      if (hostname.startsWith('[') && hostname.endsWith(']')) {
-        hostname = hostname.slice(1, -1);
+      const hostname = SSRFProtection.normalizeHostname(url);
+      if (!hostname) {
+        return { valid: false, reason: 'Invalid URL format' };
       }
 
       // Step 2: ALWAYS block cloud metadata endpoints (all modes)
@@ -464,8 +479,9 @@ export class SSRFProtection {
                         resolvedIP === '::1' ||
                         resolvedIP.startsWith('127.');
 
-    // MODE: strict - Block localhost and private IPs
-    if (mode === 'strict' && isLocalhost) {
+    // MODE: strict - Block localhost and private IPs. A `*.localhost` name is
+    // refused by name here, but in moderate it is judged by its resolved address.
+    if (mode === 'strict' && (isLocalhost || SSRFProtection.isLocalhostSubdomain(hostname))) {
       logger.warn('SSRF blocked: Localhost not allowed in strict mode', {
         hostname,
         resolvedIP
@@ -642,9 +658,9 @@ export class SSRFProtection {
       return { valid: false, reason: 'Userinfo in URL is not allowed' };
     }
 
-    let hostname = url.hostname.toLowerCase();
-    if (hostname.startsWith('[') && hostname.endsWith(']')) {
-      hostname = hostname.slice(1, -1);
+    const hostname = SSRFProtection.normalizeHostname(url);
+    if (!hostname) {
+      return { valid: false, reason: 'Invalid URL format' };
     }
 
     if (SSRFProtection.isCloudMetadata(hostname)) {
@@ -664,7 +680,8 @@ export class SSRFProtection {
       return { valid: true };
     }
 
-    const isLocalhost = SSRFProtection.isLoopbackHost(hostname);
+    const isLocalhost = SSRFProtection.isLoopbackHost(hostname) ||
+                        SSRFProtection.isLocalhostSubdomain(hostname);
 
     if (mode === 'strict' && isLocalhost) {
       return { valid: false, reason: 'Localhost access is blocked in strict mode' };

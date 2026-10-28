@@ -254,6 +254,14 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
       // Form triggers use /form/<webhookId> endpoint
       const formPath = triggerInfo?.webhookPath || triggerInfo?.node?.parameters?.path || input.workflowId;
       const formUrl = `${baseUrl.replace(/\/+$/, '')}/form/${formPath}`;
+      if (!this.isUnderTriggerPrefix(formUrl, baseUrl, 'form')) {
+        return this.errorResponse(input, 'Invalid form path', startTime, {
+          details: {
+            formFields: formFieldDefs,
+            hint: generateFormUsageHint(formFieldDefs),
+          },
+        });
+      }
 
       // Merge formData and data (formData takes precedence)
       const inputFields = {

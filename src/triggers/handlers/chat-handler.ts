@@ -83,6 +83,10 @@ export class ChatHandler extends BaseTriggerHandler<ChatTriggerInput> {
         chatUrl = `${baseUrl.replace(/\/+$/, '')}/webhook/${input.workflowId}`;
       }
 
+      if (!this.isUnderTriggerPrefix(chatUrl, baseUrl, 'webhook')) {
+        return this.errorResponse(input, 'Invalid webhook path', startTime);
+      }
+
       // SSRF protection
       const { SSRFProtection } = await import('../../utils/ssrf-protection');
       const validation = await SSRFProtection.validateWebhookUrl(chatUrl);

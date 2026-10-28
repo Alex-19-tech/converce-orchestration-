@@ -77,6 +77,10 @@ export class WebhookHandler extends BaseTriggerHandler<WebhookTriggerInput> {
         );
       }
 
+      if (!this.isUnderTriggerPrefix(webhookUrl, baseUrl, 'webhook')) {
+        return this.errorResponse(input, 'Invalid webhook path', startTime);
+      }
+
       // Determine HTTP method
       const httpMethod = input.httpMethod || triggerInfo?.httpMethod || 'POST';
 
